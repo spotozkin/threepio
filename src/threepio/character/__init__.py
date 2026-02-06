@@ -1,0 +1,1 @@
+"""Character and persona module."""

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "threepio"
+version = "0.1.0"
+description = "THREEPIO - C-3PO head AI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+openai = [
+    "openai>=1.0",
+]
+neopixel = [
+    "adafruit-circuitpython-neopixel",
+    "adafruit-blinka",
+]
+realtime = [
+    "openai>=1.0",
+    "websockets>=12",
+    "sounddevice>=0.4.6",
+    "numpy>=1.26",
+    "certifi>=2024.0",
+]
+
+[project.scripts]
+threepio = "threepio.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
