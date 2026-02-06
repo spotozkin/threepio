@@ -1,0 +1,32 @@
+# Virtual environments
+.venv/
+.venv-train/
+venv/
+env/
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Audio datasets & generated artifacts
+data/voice_raw/
+data/voice_clean/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
