@@ -30,3 +30,8 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local envs / models / tools (do not commit)
+.venv*/
+models/
+tools/
