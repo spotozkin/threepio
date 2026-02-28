@@ -18,7 +18,9 @@ class Settings(BaseSettings):
     """Application settings from env with defaults."""
 
     model_config = SettingsConfigDict(
-        env_file=None,  # Read only os.environ; .env loaded by direnv or __main__
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
         extra="ignore",
     )
 
@@ -110,6 +112,10 @@ class Settings(BaseSettings):
     C3PO_LIMIT: float = Field(default=0.95, description="Limiter ceiling 0–1 (_AB_fix1=0.95)")
 
     # ElevenLabs (optional; used by C3PO FX for speed when PROVIDER_TTS=elevenlabs)
+    ELEVENLABS_API_KEY: str | None = Field(default=None, description="ElevenLabs API key")
+    ELEVENLABS_VOICE_ID: str | None = Field(default=None, description="ElevenLabs voice ID")
+    ELEVENLABS_MODEL_ID: str | None = Field(default=None, description="ElevenLabs model ID")
+    ELEVENLABS_OUTPUT_FORMAT: str | None = Field(default=None, description="ElevenLabs output format (e.g. mp3_44100_128)")
     ELEVENLABS_SPEED: float = Field(default=1.0, ge=0.5, le=2.0, description="TTS playback speed (0.5–2.0)")
 
     # STT (faster-whisper / ambient)

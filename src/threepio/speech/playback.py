@@ -159,7 +159,7 @@ def get_playback_command_with_mode(path: str | Path, mode: str) -> Tuple[list[st
     if mode == "mpg123":
         cmd = prefer_mpg123()
         return (cmd, "mpg123") if cmd else (None, "mpg123(unavailable)")
-    # auto
+    # auto: platform-specific preference order
     if is_darwin:
         afplay_path = _which("afplay")
         if afplay_path:
@@ -167,15 +167,22 @@ def get_playback_command_with_mode(path: str | Path, mode: str) -> Tuple[list[st
                 print(f"[playback] resolved mode=auto binary={afplay_path}", flush=True)
             return ([afplay_path, str(path)], "afplay")
         return (None, "afplay(unavailable)")
+    if sys.platform.startswith("linux"):
+        # Linux: aplay → ffplay → mpg123
+        cmd = prefer_aplay()
+        if cmd:
+            return (cmd, "aplay")
+        cmd = prefer_ffplay()
+        if cmd:
+            return (cmd, "ffplay")
+        cmd = prefer_mpg123()
+        if cmd:
+            return (cmd, "mpg123")
+        return (None, "none(unavailable)")
+    # Other platforms: ffplay only
     cmd = prefer_ffplay()
     if cmd:
         return (cmd, "ffplay")
-    cmd = prefer_aplay()
-    if cmd:
-        return (cmd, "aplay")
-    cmd = prefer_mpg123()
-    if cmd:
-        return (cmd, "mpg123")
     return (None, "none(unavailable)")
 
 
@@ -196,14 +203,17 @@ def resolve_player_binary(mode: str) -> Optional[str]:
         return _which("aplay")
     if mode == "mpg123":
         return _which("mpg123")
-    # auto
+    # auto: platform-specific preference order
     if sys.platform == "darwin":
         return _which("afplay")
-    for cmd in ("ffplay", "aplay", "mpg123"):
-        path = _which(cmd)
-        if path:
-            return path
-    return None
+    if sys.platform.startswith("linux"):
+        for cmd in ("aplay", "ffplay", "mpg123"):
+            path = _which(cmd)
+            if path:
+                return path
+        return None
+    # Other platforms: ffplay only
+    return _which("ffplay")
 
 
 def get_resolved_playback_binary(mode: str) -> str | None:

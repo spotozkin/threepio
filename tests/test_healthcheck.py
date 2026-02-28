@@ -57,24 +57,23 @@ def test_run_startup_checks_elevenlabs_missing_raises() -> None:
 
 
 def test_run_startup_checks_elevenlabs_ok_with_env(tmp_path: Path) -> None:
-    """PROVIDER_TTS=elevenlabs with all env set passes (mocked which + dirs)."""
+    """PROVIDER_TTS=elevenlabs with Settings having ElevenLabs keys passes (mocked which + dirs)."""
     settings = MagicMock()
     settings.PROVIDER_TTS = "elevenlabs"
     settings.PROVIDER_STT = "mock"
     settings.PROVIDER_LLM = "mock"
     settings.AUDIO_OUTPUT_MODE = "print"
     settings.OPENAI_API_KEY = None
+    settings.ELEVENLABS_API_KEY = "sk-x"
+    settings.ELEVENLABS_VOICE_ID = "v1"
+    settings.ELEVENLABS_MODEL_ID = "eleven_v2"
 
-    env = {"ELEVENLABS_API_KEY": "sk-x", "ELEVENLABS_VOICE_ID": "v1", "ELEVENLABS_MODEL_ID": "eleven_v2"}
-    with pytest.MonkeyPatch.context() as m:
-        for k, v in env.items():
-            m.setenv(k, v)
-        report = run_startup_checks(
-            settings,
-            which_func=lambda c: "/usr/bin/ffmpeg" if c == "ffmpeg" else None,
-            data_dirs=("data/tts",),
-            cwd=tmp_path,
-        )
+    report = run_startup_checks(
+        settings,
+        which_func=lambda c: "/usr/bin/ffmpeg" if c == "ffmpeg" else None,
+        data_dirs=("data/tts",),
+        cwd=tmp_path,
+    )
     assert report["ok"] is True
     assert "ELEVENLABS" not in str(report.get("errors", []))
 
