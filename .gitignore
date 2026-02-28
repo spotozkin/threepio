@@ -36,3 +36,13 @@ Thumbs.db
 .venv*/
 models/
 tools/
+
+# Local runtime artifacts
+data/
+data/tts/
+
+# direnv local config
+.envrc
+
+# Python venv
+.venv/
