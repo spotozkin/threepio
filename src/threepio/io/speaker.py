@@ -28,27 +28,19 @@ class MockSpeakerOutput(SpeakerOutput):
 
 
 class MacSpeakerOutput(SpeakerOutput):
-    """macOS: write to temp file and play via afplay."""
+    """Play audio via canonical threepio.speech.playback (afplay on macOS when mode=auto; ffplay/aplay/mpg123 on Linux/Pi)."""
 
     def play(self, audio_bytes: bytes, format: str = "mp3") -> None:
-        """Write bytes to temp file and run afplay."""
+        """Write bytes to temp file and play via threepio.speech.playback."""
         suffix = f".{format}" if not format.startswith(".") else format
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             path = Path(f.name)
             f.write(audio_bytes)
         try:
-            logger.debug("[Speaker] Playing %s via afplay", path)
-            subprocess.run(
-                ["afplay", str(path)],
-                check=True,
-                capture_output=True,
-                timeout=120,
-            )
+            from threepio.speech.playback import play_file
+            play_file(path)
         except subprocess.CalledProcessError as e:
-            logger.error("[Speaker] afplay failed: %s", e)
-            raise
-        except FileNotFoundError:
-            logger.error("[Speaker] afplay not found (macOS only)")
+            logger.error("[Speaker] playback failed: %s", e)
             raise
         finally:
             path.unlink(missing_ok=True)

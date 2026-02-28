@@ -72,21 +72,22 @@ def run_main_loop() -> None:
 def _validate_openai_key(api_key: str | None) -> None:
     """Raise if OPENAI_API_KEY is missing or invalid (required for Realtime API)."""
     if not api_key or not str(api_key).strip():
-        raise RuntimeError(
-            "OPENAI_API_KEY not set. Create a .env file with a valid OpenAI API key."
-        )
+        raise RuntimeError("OPENAI_API_KEY not set")
     if not str(api_key).strip().startswith("sk-"):
         raise RuntimeError(
             "OPENAI_API_KEY appears invalid (must start with sk-). "
-            "Check your .env file."
+            "Set OPENAI_API_KEY in .env or export it."
         )
 
 
 def _should_run_realtime() -> bool:
-    """True if realtime voice provider is configured and available."""
+    """True if realtime voice provider is configured and available. Raises if realtime requested but key missing."""
     settings = get_settings()
     if settings.PROVIDER_VOICE != "realtime":
         return False
+    # Explicit check: no silent fallback when realtime requested without key
+    if not (settings.OPENAI_API_KEY and str(settings.OPENAI_API_KEY).strip()):
+        raise RuntimeError("OPENAI_API_KEY not set")
     _validate_openai_key(settings.OPENAI_API_KEY)
     logger.info("[ENV] OPENAI_API_KEY loaded")
     try:

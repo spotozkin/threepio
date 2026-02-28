@@ -2,7 +2,6 @@
 
 import logging
 import queue
-import subprocess
 import tempfile
 import threading
 from abc import ABC, abstractmethod
@@ -48,7 +47,7 @@ class PrintOutput(AudioOutput):
 
 
 class PlayOutput(AudioOutput):
-    """Play PCM16 via sounddevice or fallback to afplay."""
+    """Play PCM16 via sounddevice or, when unavailable, via cross-platform file playback (ffplay/aplay/mpg123)."""
 
     def __init__(self, sr: int = 24000, device: int | str | None = None) -> None:
         self._sr = sr
@@ -82,7 +81,8 @@ class PlayOutput(AudioOutput):
                         path = Path(f.name)
                         self._write_wav(path, data)
                     try:
-                        subprocess.run(["afplay", str(path)], check=True, capture_output=True, timeout=60)
+                        from threepio.speech.playback import play_file
+                        play_file(path)
                     finally:
                         path.unlink(missing_ok=True)
             except queue.Empty:

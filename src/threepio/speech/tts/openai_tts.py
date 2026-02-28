@@ -45,5 +45,5 @@ class OpenAITTS(BaseTTS):
         if self._speaker:
             self._speaker.play(audio_bytes, format="mp3")
         else:
-            logger.debug("[OpenAITTS] No speaker configured, skipping playback")
+            logger.debug("[OpenAITTS] Skipping playback (AUDIO_OUTPUT_MODE=print or no player)")
             print(f"[TTS] {text} (no speaker)")

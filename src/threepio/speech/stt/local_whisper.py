@@ -1,0 +1,44 @@
+"""Local Whisper STT using faster-whisper."""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Lazy model singleton
+_model = None
+_model_size: str | None = None
+
+
+def transcribe(
+    path: Path,
+    *,
+    model_size: str = "small",
+    language: str | None = None,
+    beam_size: int = 5,
+) -> tuple[str, Any]:
+    """Transcribe WAV/audio file to text using faster-whisper.
+
+    Returns (text, info) where info has .language (detected or requested).
+    Raises RuntimeError if faster-whisper is not installed.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Audio file not found: {path}")
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as e:
+        raise RuntimeError(
+            "faster-whisper not installed. pip install faster-whisper"
+        ) from e
+    global _model, _model_size
+    if _model is None or _model_size != model_size:
+        logger.info("[local_whisper] loading model %s", model_size)
+        _model = WhisperModel(model_size)
+        _model_size = model_size
+    segments, info = _model.transcribe(str(path), language=language, beam_size=beam_size)
+    text = " ".join(s.text.strip() for s in segments if s.text).strip()
+    return (text, info)

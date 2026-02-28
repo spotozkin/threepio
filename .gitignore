@@ -21,6 +21,7 @@ dist/
 # Audio datasets & generated artifacts
 data/voice_raw/
 data/voice_clean/
+data/memory/
 
 # Testing
 .pytest_cache/

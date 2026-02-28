@@ -42,6 +42,8 @@ source .venv/bin/activate
 pytest
 ```
 
+**Deterministic runs (no direnv / .env):** from project root, run `./scripts/test_clean_env.sh` to run pytest with a clean environment so local secrets don't affect results.
+
 ## OpenAI TTS
 
 To use real voice synthesis instead of printed output:
@@ -52,7 +54,7 @@ To use real voice synthesis instead of printed output:
    - `PROVIDER_TTS=openai`
    - `TTS_VOICE=alloy` (optional, default)
    - `TTS_MODEL=gpt-4o-mini-tts` (optional, default)
-   - `AUDIO_OUTPUT_MODE=play` (macOS: plays via afplay; use `print` to only print)
+   - `AUDIO_OUTPUT_MODE=auto` or `afplay` (macOS: plays via afplay; use `print` to only print)
 
 Without `OPENAI_API_KEY` or with `PROVIDER_TTS=mock`, the app automatically uses MockTTS.
 
@@ -73,12 +75,49 @@ python -m threepio
 
 # Run with mic + playback
 export AUDIO_INPUT_MODE=mic
-export AUDIO_OUTPUT_MODE=play
+export AUDIO_OUTPUT_MODE=afplay
 python -m threepio
 ```
 
 Requires: `OPENAI_API_KEY`, `PROVIDER_VOICE=realtime`, and the realtime extra.  
 Without these, the app falls back to CLI mode (`PROVIDER_VOICE=cli`).
+
+## Ambient voice (laptop demo)
+
+Continuous listen → STT → LLM → TTS with barge-in. Use these env vars and run:
+
+```bash
+# Mic device (sounddevice index or name substring); optional
+export THREEPIO_AUDIO_INPUT_DEVICE=1
+
+# Min speech duration before sending to STT (seconds); default 1.2
+export THREEPIO_MIN_UTTERANCE_SEC=0.7
+
+# C-3PO voice post-processing (ffmpeg chain)
+export ENABLE_C3PO_FX=true
+
+# Run ambient (debug + afplay for laptop)
+THREEPIO_DEBUG=1 AUDIO_OUTPUT_MODE=afplay python -m threepio.modes.ambient
+```
+
+Or via main entry: `python -m threepio --ambient`. Override mic with `--device-in N`; otherwise `THREEPIO_AUDIO_INPUT_DEVICE` or system default is used. Ambient runs without crashing even if some settings fields are missing (defensive `getattr` where needed).
+
+VAD tuning: `THREEPIO_VAD_START_RMS` (float, default 0.004), `THREEPIO_VAD_COOLDOWN_MS` (int, default 400), `THREEPIO_VAD_AGGR` (0–3, default 2), `THREEPIO_MIN_UTTERANCE_SEC` (float; env overrides settings). These are read in one place each (vad.py or ambient) and used consistently.
+
+### Validating on macOS
+
+```bash
+# A) VAD-test mode (no STT/LLM/TTS): 10s mic capture, print rms/peak and would_accept
+python -m threepio --vad-test
+
+# B) Ambient with print (no audio playback)
+AUDIO_OUTPUT_MODE=print python -m threepio --ambient
+
+# C) Ambient with afplay (play TTS through speakers)
+AUDIO_OUTPUT_MODE=afplay python -m threepio --ambient
+```
+
+Use `THREEPIO_DEBUG=1` for detailed VAD/reject logs (reason, rms, threshold, cooldown_remaining_ms, device_index, sample_rate).
 
 ## Eyes (C-3PO amber glow)
 
@@ -198,7 +237,13 @@ python -m threepio
 
 # Realtime voice (mic + play)
 export AUDIO_INPUT_MODE=mic
-export AUDIO_OUTPUT_MODE=play
+export AUDIO_OUTPUT_MODE=afplay
 python -m threepio
+
+# Ambient voice (laptop demo: input device, min utterance, C-3PO FX)
+export THREEPIO_AUDIO_INPUT_DEVICE=1
+export THREEPIO_MIN_UTTERANCE_SEC=0.7
+export ENABLE_C3PO_FX=true
+THREEPIO_DEBUG=1 AUDIO_OUTPUT_MODE=afplay python -m threepio.modes.ambient
 ```
 # C3P0
