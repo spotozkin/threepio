@@ -6,6 +6,8 @@ import argparse
 import sys
 from typing import Any, NoReturn
 
+from threepio.memory.user_profile import load_or_prompt_profile
+
 __all__ = ["main"]
 
 
@@ -47,6 +49,11 @@ def _parse_args():
         "--vad-test",
         action="store_true",
         help="Run mic capture 10s and print rms/peak and whether speech would be accepted (no STT/LLM/TTS). Tune THREEPIO_VAD_START_RMS.",
+    )
+    parser.add_argument(
+        "--setup-profile",
+        action="store_true",
+        help="Run interactive profile setup and exit",
     )
     return parser.parse_known_args()
 
@@ -164,6 +171,12 @@ def _run_ambient(settings: Any, device_in: int | None = None, vad_threshold: flo
 def main() -> NoReturn:
     """Parse CLI; run --healthcheck, --tts-test, or --ambient before other modes, else run app."""
     args, _ = _parse_args()
+    if args.setup_profile:
+        from threepio.memory.user_profile import prompt_profile, save_profile_file
+        profile = prompt_profile()
+        save_profile_file(profile)
+        return
+    profile = load_or_prompt_profile()
     if getattr(args, "healthcheck", False):
         code = _run_healthcheck()
         sys.exit(code)

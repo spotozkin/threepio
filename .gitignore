@@ -41,8 +41,14 @@ tools/
 data/
 data/tts/
 
+# First-run user profile (do not commit)
+.threepio/
+.threepio/profile.json
+
 # direnv local config
 .envrc
 
 # Python venv
 .venv/
+
+.threepio/

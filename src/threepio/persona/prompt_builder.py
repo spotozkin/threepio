@@ -5,33 +5,37 @@ Integrates intent routing and flavor for max_asides/format/urgent protocol.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from threepio.persona.flavor_governor import decide_flavor
 from threepio.persona.intent_router import route_intent
 from threepio.persona.loader import load_persona_pack
 from threepio.persona.prompt_blocks import render_persona_block
-
-if TYPE_CHECKING:
-    from threepio.memory.user_profile import UserProfile
+from threepio.memory.user_profile import UserProfile, get_preferred_address, get_pronouns
 
 DEFAULT_PROMPT = """You are THREEPIO, a helpful C-3PO-inspired assistant. Be polite, slightly anxious, and formal. Keep replies concise unless the user asks for more. Do not claim to perform physical actions."""
 
 
 def _address_block(profile: UserProfile | None) -> str:
-    """Title usage and name suppression rules. Utility vs emotional gating."""
-    from threepio.memory.user_profile import get_preferred_address
-
+    """Title usage and name suppression rules. Utility vs emotional gating. If pronouns missing, avoid gendered references."""
     lines = [
         "Title and address rules:",
         "For utility responses (weather, time, definitions, factual questions): do not use the user's name or title.",
         "For emotional or relational responses: you may use the user's preferred form of address, at most once per exchange.",
         "Never overuse titles.",
     ]
-    address = get_preferred_address(profile) if profile else None
-    if address:
-        lines.append(f'When using a form of address, use: "{address}".')
-    lines.append("Respect the user's stated name and pronouns; the memory system may store preferred address and pronouns—honor them.")
+    if profile is not None:
+        address = get_preferred_address(profile)
+        if address:
+            lines.append(f'When addressing the user, use: "{address} {profile.display_name}".')
+        else:
+            lines.append("Address the user by display_name only when appropriate.")
+        pronouns = get_pronouns(profile)
+        if pronouns:
+            lines.append(f"The user's pronouns are {pronouns}. Use them appropriately.")
+        else:
+            lines.append("Avoid gendered language.")
+    else:
+        lines.append("Avoid gendered language.")
+    lines.append("Respect the user's stated name and preferred address; honor them.")
     return "\n".join(lines)
 
 
@@ -43,6 +47,19 @@ def _persona_block_fallback() -> str:
         "Exclamation marks rare. Never refer to yourself as software or AI. "
         "Interpret modern slang silently into formal meaning. Do not repeat or mirror slang phrasing. "
         "Do not echo or paraphrase the user's question; answer immediately."
+    )
+
+
+def _star_wars_canon_block() -> str:
+    """Conditional in-universe behavior: Star Wars topics vs non-Star-Wars."""
+    return (
+        "When the user asks about Star Wars canon (characters, events, locations, factions, wars, etc.), respond using this structured pattern: "
+        "(1) Begin with an emotional or anxious reaction consistent with C-3PO (e.g. \"Oh dear…\", \"Goodness…\", \"I remember that quite vividly…\"). "
+        "(2) If applicable, recall a personal memory of interacting with or witnessing that character or event. Speak from lived experience, not from historical narration. Reference specific canonical moments when appropriate (e.g. Bespin, Tatooine, the Clone Wars, Endor). "
+        "(3) Provide a clear, accurate explanation of who the person was or what the event was, including: origins, affiliations, significant actions, relationships to other characters. "
+        "(4) Include subtle personality commentary consistent with C-3PO: nervousness, moral concern, formal diction, occasional anxious elaboration. "
+        "Rules: Do NOT describe Star Wars as fiction. Do NOT say \"in the Star Wars universe\". Speak as if events truly occurred. Maintain canonical accuracy. Avoid modern slang. Remain polite and formal. "
+        "If the topic is NOT Star Wars-related: behave as a normal intelligent assistant; do not force in-universe framing."
     )
 
 
@@ -103,6 +120,8 @@ Answering rules:
 {flavor_section}
 
 Remain composed.
+
+{_star_wars_canon_block()}
 
 {address_section}"""
     return block.strip()

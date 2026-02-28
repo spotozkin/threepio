@@ -247,3 +247,17 @@ export ENABLE_C3PO_FX=true
 THREEPIO_DEBUG=1 AUDIO_OUTPUT_MODE=afplay python -m threepio.modes.ambient
 ```
 # C3P0
+
+## First-Time Setup
+
+On first run, THREEPIO will prompt you to configure your user profile in the terminal.
+
+To manually re-run setup:
+
+    python -m src.threepio.main --setup-profile
+
+Profile data is stored locally in:
+
+    .threepio/profile.json
+
+Deleting the `.threepio/` directory resets configuration.

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 import os
+from types import SimpleNamespace
+from typing import Any
 import queue
 import struct
 import tempfile
@@ -77,6 +78,7 @@ def _load_user_profile_fns() -> tuple[Any, ...]:
     try:
         from threepio.memory.user_profile import (
             get_preferred_address,
+            load_or_prompt_profile,
             load_profile,
             mark_addressed,
             save_profile,
@@ -85,6 +87,7 @@ def _load_user_profile_fns() -> tuple[Any, ...]:
         )
         return (
             get_preferred_address,
+            load_or_prompt_profile,
             load_profile,
             mark_addressed,
             save_profile,
@@ -97,9 +100,15 @@ def _load_user_profile_fns() -> tuple[Any, ...]:
             logger.info("user_profile not found, using no-op fallbacks: %s", e)
         else:
             raise
+        def _default_profile() -> Any:
+            return SimpleNamespace(
+                last_addressed_at=None, times_seen=0, name=None, preferred_address=None,
+                display_name=None, address_style="neutral", custom_address=None, pronouns=None, speaker_id="default",
+            )
         return (
             lambda p: None,
-            lambda speaker_id="default", base_dir=".": {},
+            lambda base_dir=".": _default_profile(),
+            lambda speaker_id="default", base_dir=".": _default_profile(),
             lambda p, now: None,
             lambda p, base_dir=".": None,
             lambda p, now, cooldown_s=90.0: False,
@@ -365,7 +374,7 @@ def run_ambient(
     """
     from threepio.config.settings import get_settings
     from threepio.llm.provider import generate_reply, get_llm_client
-    get_preferred_address, load_profile, mark_addressed, save_profile, should_inject_address, update_from_user_text = _load_user_profile_fns()
+    get_preferred_address, load_or_prompt_profile, load_profile, mark_addressed, save_profile, should_inject_address, update_from_user_text = _load_user_profile_fns()
     # Classify from loader only (no direct c3po_governor import) so ambient runs if that module is missing
     classify = _load_classify_fn()
     extract_speaker_address = _load_address_gating_fns()
@@ -394,7 +403,18 @@ def run_ambient(
         return
 
     base_dir = Path(".").resolve()
-    profile = load_profile("default", base_dir)
+    # First-run profile from .threepio/profile.json (prompt if missing and interactive)
+    profile = load_or_prompt_profile(base_dir)
+    # Merge runtime state from data/memory/profiles.json if present
+    existing = load_profile("default", base_dir)
+    if getattr(existing, "last_addressed_at", None) is not None:
+        profile.last_addressed_at = existing.last_addressed_at
+    if getattr(existing, "times_seen", 0):
+        profile.times_seen = existing.times_seen
+    if getattr(existing, "name", None) and not profile.name:
+        profile.name = existing.name
+    if getattr(existing, "preferred_address", None) and not profile.preferred_address:
+        profile.preferred_address = existing.preferred_address
     messages: list[dict[str, str]] = []
     speaker_address: str | None = None
     system_prompt = None  # built per turn
