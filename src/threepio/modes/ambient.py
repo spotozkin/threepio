@@ -4,21 +4,24 @@ from __future__ import annotations
 
 import logging
 import os
-from types import SimpleNamespace
-from typing import Any
 import queue
+import select
+import signal
 import struct
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 from threepio.audio.mic_stream import (
     MicStream,
-    _device_info_from_query,
     frame_rms_peak,
-    resolve_audio_input_device,
     write_wav as write_wav_frames,
 )
 from threepio.audio.vad import (
@@ -32,7 +35,9 @@ from threepio.audio.vad import (
     energy_bargein_confirmed,
     energy_speech_end,
     energy_speech_start,
+    get_barge_in_baseline_floor,
     get_bargein_confirm_ms,
+    get_energy_end_threshold,
     get_post_speech_cooldown_ms,
     get_speech_suppress_ms,
     get_vad_cooldown_ms,
@@ -44,6 +49,33 @@ from threepio.audio.vad import (
 from threepio.speech.playback import NO_PLAYER_MESSAGE, PlaybackHandle, play_audio_file_interruptible
 
 logger = logging.getLogger(__name__)
+
+CORR_SAMPLE_RATE = 16000
+
+
+def _decode_audio_to_pcm_16k(path: Path) -> Any:
+    """Decode WAV/MP3 to float32 mono 16kHz. Returns np.ndarray or empty array on failure."""
+    import numpy as np
+
+    path = Path(path)
+    if not path.exists():
+        return np.array([], dtype=np.float32)
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(path),
+                "-f", "f32le", "-ar", str(CORR_SAMPLE_RATE), "-ac", "1",
+                "-",
+            ],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return np.array([], dtype=np.float32)
+        return np.frombuffer(proc.stdout, dtype=np.float32)
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        return np.array([], dtype=np.float32)
 
 
 def _frame_min_max_int16(frame: bytes) -> tuple[int, int]:
@@ -59,6 +91,10 @@ def _frame_min_max_int16(frame: bytes) -> tuple[int, int]:
 
 
 SILENCE_MS_THRESHOLD = 700
+# After playback ends: discard captured audio for this long so we do not transcribe TTS echo (ms)
+POST_PLAYBACK_DRAIN_MS = 400
+# After barge-in: flush mic and ignore VAD for this long, then require fresh speech_start (ms)
+POST_PLAYBACK_IGNORE_MS = 350
 
 
 def _debug_enabled() -> bool:
@@ -274,24 +310,24 @@ def run_vad_test(device_in: int | None = None, duration_sec: float = 10.0) -> No
     Run mic capture for duration_sec and print rms/peak plus whether speech would be accepted
     (RMS gate only; no STT/LLM/TTS). Use to tune THREEPIO_VAD_START_RMS and related env vars.
     """
-    import sounddevice as sd
+    from threepio.audio.devices import resolve_input_device
+
     if device_in is None:
-        resolved_device_index, _ = resolve_audio_input_device()
-    elif isinstance(device_in, int):
-        resolved_device_index = device_in
+        selector = os.environ.get("THREEPIO_AUDIO_INPUT_DEVICE", "").strip() or None
     else:
-        resolved_device_index, _ = resolve_audio_input_device(str(device_in))
-    if resolved_device_index is None:
-        _status("No input device resolved; set THREEPIO_AUDIO_INPUT_DEVICE.")
+        selector = str(device_in)
+    try:
+        idx, name = resolve_input_device(selector)
+    except RuntimeError as e:
+        _status(str(e))
         return
-    resolved_device_index = int(resolved_device_index)
-    mic = MicStream(device=resolved_device_index)
+    mic = MicStream(device=idx)
     try:
         mic.start()
     except Exception as e:
         _status(f"Mic failed: {e}")
         return
-    _status(f"VAD test: {duration_sec}s capture on device {resolved_device_index}. Speak to see rms/would_accept.")
+    _status(f"VAD test: {duration_sec}s capture on device {idx}. Speak to see rms/would_accept.")
     start = time.time()
     preroll: list[bytes] = []
     recent_frames: list[bytes] = []
@@ -341,10 +377,27 @@ def run(
 ) -> int:
     """
     Single public entrypoint for ambient mode. Starts the state machine loop and blocks.
-    Returns 0 if loop exits normally, 1 if startup failed or exited early.
+    Returns 0 if loop exits normally (SIGTERM/SIGINT), 1 if startup failed or exited early.
     """
     _status("starting")
-    mode = getattr(settings, "AUDIO_OUTPUT_MODE", "auto") or "auto"
+    # Startup diagnostics: list input devices and output mode
+    try:
+        from threepio.audio.devices import format_input_devices, list_input_devices
+        devs = list_input_devices()
+        if devs:
+            logger.info("Audio input devices: %s", format_input_devices(devs).replace("\n", " | "))
+            print("[ambient] input devices: " + format_input_devices(devs).replace("\n", " | "), flush=True)
+        else:
+            print("[ambient] input devices: none found", flush=True)
+    except Exception as e:
+        logger.debug("Could not list input devices: %s", e)
+    out_mode = getattr(settings, "AUDIO_OUTPUT_MODE", "auto") or "auto"
+    out_dev = os.environ.get("THREEPIO_AUDIO_OUTPUT_DEVICE", "").strip() or getattr(settings, "AUDIO_OUTPUT_DEVICE", None)
+    out_dev_str = str(out_dev) if out_dev else "(default)"
+    logger.info("AUDIO_OUTPUT_MODE=%s THREEPIO_AUDIO_OUTPUT_DEVICE=%s", out_mode, out_dev_str)
+    print(f"[ambient] output mode={out_mode} device={out_dev_str}", flush=True)
+
+    mode = out_mode
     try:
         from threepio.speech.playback import get_playback_command_with_mode
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -357,20 +410,23 @@ def run(
     except Exception:
         playback_name = mode
     _status(f"playback={playback_name}")
+    barge_in_mode = getattr(settings, "BARGE_IN_MODE", "full") or "full"
+    logger.info("BARGE_IN_MODE=%s", barge_in_mode)
+    print(f"[ambient] startup BARGE_IN_MODE={barge_in_mode}", flush=True)
 
     silence_ms = int(vad_threshold) if vad_threshold is not None else SILENCE_MS_THRESHOLD
-    run_ambient(mic_device=device_in, silence_ms=silence_ms)
-    return 1
+    return run_ambient(mic_device=device_in, silence_ms=silence_ms)
 
 
 def run_ambient(
     *,
     mic_device: int | str | None = None,
     silence_ms: int = SILENCE_MS_THRESHOLD,
-) -> None:
+) -> int:
     """
     Run ambient loop: IDLE -> LISTENING -> THINKING -> SPEAKING.
     Barge-in: when user speaks during SPEAKING, stop playback and go to LISTENING.
+    Returns 0 on graceful shutdown (SIGTERM/SIGINT), 1 on startup failure or early exit.
     """
     from threepio.config.settings import get_settings
     from threepio.llm.provider import generate_reply, get_llm_client
@@ -400,7 +456,7 @@ def run_ambient(
         llm_client = get_llm_client()
     except Exception as e:
         _status(f"LLM unavailable: {e}. --ambient requires OPENAI_API_KEY and PROVIDER_LLM=openai.")
-        return
+        return 1
 
     base_dir = Path(".").resolve()
     # First-run profile from .threepio/profile.json (prompt if missing and interactive)
@@ -420,26 +476,26 @@ def run_ambient(
     system_prompt = None  # built per turn
 
     # Resolve input device: numeric string → int index; else substring match (input-capable only)
-    import sounddevice as sd
+    from threepio.audio.devices import resolve_input_device
+
     if mic_device is None:
-        resolved_device_index, resolved_device_name = resolve_audio_input_device()
-    elif isinstance(mic_device, int):
-        resolved_device_index = mic_device
-        resolved_device_name = str(mic_device)
+        selector = os.environ.get("THREEPIO_AUDIO_INPUT_DEVICE", "").strip() or None
+        if not selector and getattr(settings, "AUDIO_INPUT_DEVICE", None) is not None:
+            selector = str(settings.AUDIO_INPUT_DEVICE)
     else:
-        resolved_device_index, resolved_device_name = resolve_audio_input_device(str(mic_device))
-    if resolved_device_index is None:
-        _status("No input device resolved; set THREEPIO_AUDIO_INPUT_DEVICE (e.g. 1 or device name substring).")
-        return
-    resolved_device_index = int(resolved_device_index)
-    name, max_input_channels, default_samplerate = _device_info_from_query(sd, resolved_device_index)
-    _status(f"resolved input: index={resolved_device_index} name={name!r} (THREEPIO_AUDIO_INPUT_DEVICE or default)")
-    mic = MicStream(device=resolved_device_index)
+        selector = str(mic_device)
+    try:
+        idx, name = resolve_input_device(selector)
+    except RuntimeError as e:
+        _status(str(e))
+        return 1
+    _status(f"resolved input: index={idx} name='{name}' (THREEPIO_AUDIO_INPUT_DEVICE or default)")
+    mic = MicStream(device=idx)
     try:
         mic.start()
     except Exception as e:
         _status(f"Mic failed: {e}")
-        return
+        return 1
 
     _status("Listening. Speak to start; speak again during reply to barge-in.")
     # Min utterance: THREEPIO_MIN_UTTERANCE_SEC overrides settings.MIN_UTTERANCE_SEC
@@ -461,19 +517,37 @@ def run_ambient(
     silence_frames = max(1, silence_ms // VAD_FRAME_MS)
     rms_recent: deque[float] = deque(maxlen=max(silence_frames + 5, 50))
     cooldown_until_ts: float | None = None
+    last_cooldown_log_at: float | None = None  # throttle "trigger ignored (post-speech cooldown)" to once per second
     reject_cooldown_until_ts: float | None = None  # after "too short" or "no speech detected"
     last_reject_ts: float | None = None  # timestamp when we last rejected (for should_accept_speech)
     bargein_debounce_frames = 0  # after barge-in, discard this many frames before accumulating listen_frames
+    post_playback_drain_until_ts: float | None = None  # after SPEAKING ends, discard frames until this time (no STT of TTS echo)
+    post_playback_ignore_until_ts: float | None = None  # after barge-in: flush mic + ignore VAD until this time, then require fresh speech_start
+    utterance_ms_acc = 0  # accumulated ms in current utterance (reset on speech_start and after finalize)
+    silence_ms_acc = 0  # consecutive silence ms (reset when vad_is_speech; used for silence-hangover end)
 
     frame_queue: queue.Queue[bytes] = queue.Queue(maxsize=50)
+    from threepio.audio.ring_buffer import RingBuffer
+    from threepio.audio.correlation import compute_best_abs_corr
+
+    mic_ring = RingBuffer(capacity_ms=1200, sample_rate=CORR_SAMPLE_RATE)
+    speaker_pcm_ref: list[Any] = [None]
+    playback_start_ts_ref: list[float | None] = [None]
+    baseline_freeze_rms_ref: list[float | None] = [None]  # frozen at playback start; used for eff_min_rms during playback
+    corr_echo_samples_ref: list[list[float]] = [[]]  # collect corr values during first 1500ms when echo-only (mic not spiking)
+    corr_echo_ref: list[float | None] = [None]  # median of echo corr; adaptive allow cutoff = min(ALLOW_THRESH, corr_echo_ref*0.60)
+    CORR_ECHO_COLLECT_MS = 1500
+    speaker_lock = threading.Lock()
     raw_path: Path | None = None
     playback_path: Path | None = None
     state_ref: list[str] = [state]
     handle_ref: list[PlaybackHandle | None] = [None]
+    shutdown_requested_ref: list[bool] = [False]
+    graceful_exit_ref: list[bool] = [False]  # True when exiting due to SIGTERM/SIGINT
     ffmpeg_checked_ref: list[bool] = [False]
     ffmpeg_available_ref: list[bool] = [True]
 
-    def _on_bargein_speech_start() -> None:
+    def _on_bargein_speech_start(speech_ms: int = 0, max_rms: float = 0.0, suppression_active: bool = False) -> None:
         if state_ref[0] != SPEAKING:
             return
         # THREEPIO_ENABLE_BARGE_IN (default true). When false, never interrupt playback.
@@ -482,23 +556,224 @@ def run_ambient(
             if _debug_enabled():
                 print("[ambient] barge-in disabled (THREEPIO_ENABLE_BARGE_IN=false)", flush=True)
             return
+        barge_in_mode = (os.environ.get("BARGE_IN_MODE") or getattr(settings, "BARGE_IN_MODE", "full") or "full").strip().lower()
+        if barge_in_mode in ("off", "assisted"):
+            return
+        def _barge_env_int(name: str, default: int) -> int:
+            v = os.environ.get(name, os.environ.get("THREEPIO_" + name, "")).strip()
+            if not v:
+                return getattr(settings, name, default) if hasattr(settings, name) else default
+            try:
+                return max(0, int(v))
+            except ValueError:
+                return default
+
+        def _barge_env_float(name: str, default: float) -> float:
+            v = os.environ.get(name, os.environ.get("THREEPIO_" + name, "")).strip()
+            if not v:
+                return getattr(settings, name, default) if hasattr(settings, name) else default
+            try:
+                return max(0.0, float(v))
+            except ValueError:
+                return default
+
+        min_speech_ms = _barge_env_int("BARGE_IN_MIN_SPEECH_MS", 250)
+        min_rms = _barge_env_float("BARGE_IN_MIN_RMS", 0.0)
+        baseline_floor = _barge_env_float("BARGE_IN_BASELINE_FLOOR", 0.006)
+        echo_floor = _barge_env_float("BARGE_IN_PLAYBACK_ECHO_FLOOR", 0.070)
+        suppression_barge_mult = _barge_env_float("BARGE_IN_SUPPRESSION_BARGE_MULT", 1.35)
+        margin_mult_playback = _barge_env_float("BARGE_IN_MARGIN_MULT_PLAYBACK", 1.6)
+        margin_add_playback = _barge_env_float("BARGE_IN_MARGIN_ADD_PLAYBACK", 0.010)
+        corr_window_ms = _barge_env_int("BARGE_IN_CORR_WINDOW_MS", 200)
+        corr_lag_sweep_ms = _barge_env_int("BARGE_IN_CORR_LAG_SWEEP_MS", 60)
+        corr_lag_step_ms = _barge_env_int("BARGE_IN_CORR_LAG_STEP_MS", 10)
+        corr_block_thresh = _barge_env_float("BARGE_IN_CORR_BLOCK_THRESH", 0.65)
+        corr_allow_thresh = _barge_env_float("BARGE_IN_CORR_ALLOW_THRESH", 0.45)
+        corr_uncertain_rms_mult = _barge_env_float("BARGE_IN_CORR_UNCERTAIN_RMS_MULT", 1.25)
+        corr_confident_min = _barge_env_float("BARGE_IN_CORR_CONFIDENT_MIN", 0.15)
+        baseline_idle_rms = baseline_freeze_rms_ref[0] if baseline_freeze_rms_ref[0] is not None else vad_monitor.get_baseline_rms()
+        if baseline_idle_rms is not None:
+            baseline_idle_rms = max(baseline_idle_rms, baseline_floor)
+        if baseline_freeze_rms_ref[0] is not None:
+            print(f"[barge-in] baseline_freeze active={baseline_freeze_rms_ref[0]:.4f}", flush=True)
+        if baseline_idle_rms is not None and baseline_idle_rms > 0:
+            effective_min_rms = (
+                baseline_idle_rms * margin_mult_playback + margin_add_playback
+            )
+            effective_min_rms = max(effective_min_rms, min_rms)
+        else:
+            effective_min_rms = max(min_rms, baseline_floor)
+        idle_baseline_str = f"{baseline_idle_rms:.4f}" if baseline_idle_rms is not None else "None"
+
+        corr_val: float | None = None
+        lag_ms_val: int | None = None
+        corr_na_reason: str | None = None
+        decision = "NO_TRIGGER"
+        N_samp = int(CORR_SAMPLE_RATE * corr_window_ms / 1000)
+        sweep_samp = int(CORR_SAMPLE_RATE * corr_lag_sweep_ms / 1000)
+        required_spk = N_samp + 2 * sweep_samp
+        warmup_ms = _barge_env_int("BARGE_IN_PLAYBACK_WARMUP_MS", 350)
+        mic_seg = mic_ring.read_last_samples(N_samp)
+        spk_seg = None
+        elapsed_ms = 0.0
+        spk_len = 0
+        with speaker_lock:
+            pcm = speaker_pcm_ref[0]
+            start_ts = playback_start_ts_ref[0]
+        if pcm is not None and start_ts is not None:
+            elapsed_ms = (time.time() - start_ts) * 1000
+            end_samp = min(len(pcm), int(elapsed_ms * CORR_SAMPLE_RATE / 1000))
+            start_samp = max(0, end_samp - required_spk)
+            spk_len = end_samp - start_samp
+            if spk_len >= required_spk:
+                spk_seg = pcm[start_samp:end_samp]
+        mic_len = int(getattr(mic_seg, "size", len(mic_seg)))
+        if spk_seg is not None:
+            spk_len = int(getattr(spk_seg, "size", len(spk_seg)))
+        print(
+            f"[barge-in] corr_debug mic_sr={CORR_SAMPLE_RATE} spk_sr={CORR_SAMPLE_RATE} N={N_samp} sweep={sweep_samp} mic_len={mic_len} spk_len={spk_len} required_spk={required_spk}",
+            flush=True,
+        )
+        if elapsed_ms < warmup_ms:
+            decision = "NO_TRIGGER"
+            print(f"[barge-in] warmup_block elapsed_ms={elapsed_ms:.0f}", flush=True)
+            return
+        if spk_len < required_spk or mic_len < N_samp:
+            corr_na_reason = "insufficient_samples"
+            print(
+                f"[barge-in] corr_na reason=insufficient_samples mic_len={mic_len} spk_len={spk_len} N={N_samp} sweep={sweep_samp}",
+                flush=True,
+            )
+        elif mic_seg.size >= N_samp and spk_seg is not None and spk_seg.size >= required_spk:
+            corr_val, lag_ms_val, corr_na_reason = compute_best_abs_corr(
+                mic_seg, spk_seg, CORR_SAMPLE_RATE, corr_lag_sweep_ms, corr_lag_step_ms
+            )
+            if corr_val is None and corr_na_reason is not None:
+                print(
+                    f"[barge-in] corr_na reason={corr_na_reason} mic_len={mic_len} spk_len={spk_len} N={N_samp} sweep={sweep_samp}",
+                    flush=True,
+                )
+        if corr_val is not None and corr_val < corr_confident_min:
+            corr_val = None
+            lag_ms_val = None
+
+        nearfield_min = max(echo_floor * 1.6, effective_min_rms * 2.0)
+        if corr_val is not None and lag_ms_val is not None and spk_seg is not None:
+            import numpy as np
+            mic_rms_w = float(np.sqrt(np.mean(np.asarray(mic_seg, dtype=np.float64) ** 2)))
+            lag_samp = int(lag_ms_val * CORR_SAMPLE_RATE / 1000)
+            idx = sweep_samp + lag_samp
+            idx = max(0, min(idx, spk_seg.size - N_samp))
+            spk_slice = spk_seg[idx : idx + N_samp]
+            spk_rms_w = float(np.sqrt(np.mean(np.asarray(spk_slice, dtype=np.float64) ** 2)))
+            print(
+                f"[barge-in] corr_val corr={corr_val:.4f} lag_ms={lag_ms_val} mic_rms={mic_rms_w:.4f} spk_rms={spk_rms_w:.4f}",
+                flush=True,
+            )
+
+        if corr_val is not None and elapsed_ms >= warmup_ms and elapsed_ms < CORR_ECHO_COLLECT_MS and max_rms < nearfield_min:
+            corr_echo_samples_ref[0].append(corr_val)
+        if elapsed_ms >= CORR_ECHO_COLLECT_MS and corr_echo_ref[0] is None and corr_echo_samples_ref[0]:
+            s = sorted(corr_echo_samples_ref[0])
+            n = len(s)
+            corr_echo_ref[0] = (s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0)
+
+        if corr_val is not None:
+            if corr_val >= corr_block_thresh:
+                decision = "BLOCK_CORR"
+                print(
+                    f"[barge-in] playback=True suppression={suppression_active} flush=False speech_ms={speech_ms} mic_rms={max_rms:.4f} idle_baseline={idle_baseline_str} eff_min_rms={effective_min_rms:.4f} corr={corr_val:.4f} lag_ms={lag_ms_val} echo_floor={echo_floor:.4f} decision={decision}",
+                    flush=True,
+                )
+                return
+            if corr_val <= (allow_cutoff := (min(corr_allow_thresh, corr_echo_ref[0] * 0.60) if corr_echo_ref[0] is not None else corr_allow_thresh)):
+                allow_min_rms = max(effective_min_rms, echo_floor * 1.05)
+                if speech_ms < min_speech_ms or max_rms < allow_min_rms:
+                    decision = "NO_TRIGGER"
+                    _ce = corr_echo_ref[0]
+                    _ce_str = f"{_ce:.4f}" if _ce is not None else "None"
+                    print(
+                        f"[barge-in] corr_echo_ref={_ce_str} corr={corr_val:.4f} allow_cutoff={allow_cutoff:.4f} playback=True suppression={suppression_active} flush=False speech_ms={speech_ms} mic_rms={max_rms:.4f} idle_baseline={idle_baseline_str} eff_min_rms={effective_min_rms:.4f} lag_ms={lag_ms_val} echo_floor={echo_floor:.4f} decision={decision}",
+                        flush=True,
+                    )
+                    return
+                decision = "ALLOW_CORR"
+                _ce = corr_echo_ref[0]
+                _ce_str = f"{_ce:.4f}" if _ce is not None else "None"
+                print(
+                    f"[barge-in] corr_echo_ref={_ce_str} corr={corr_val:.4f} allow_cutoff={allow_cutoff:.4f}",
+                    flush=True,
+                )
+            else:
+                decision = "UNCERTAIN_NO_TRIGGER"
+                print(
+                    f"[barge-in] playback=True suppression={suppression_active} flush=False speech_ms={speech_ms} mic_rms={max_rms:.4f} idle_baseline={idle_baseline_str} eff_min_rms={effective_min_rms:.4f} corr={corr_val:.4f} lag_ms={lag_ms_val} echo_floor={echo_floor:.4f} decision={decision}",
+                    flush=True,
+                )
+                return
+        else:
+            _bf = baseline_freeze_rms_ref[0] or 0.0
+            nearfield_threshold = max(
+                echo_floor * 2.5,
+                effective_min_rms * 3.0,
+                _bf * 8.0,
+            )
+            print(
+                f"[barge-in] nearfield_threshold={nearfield_threshold:.4f} mic_rms={max_rms:.4f}",
+                flush=True,
+            )
+            if speech_ms < min_speech_ms or max_rms < nearfield_threshold:
+                decision = "NO_TRIGGER"
+                print(
+                    f"[barge-in] playback=True suppression={suppression_active} flush=False speech_ms={speech_ms} mic_rms={max_rms:.4f} idle_baseline={idle_baseline_str} eff_min_rms={effective_min_rms:.4f} corr=NA lag_ms=NA echo_floor={echo_floor:.4f} decision={decision}",
+                    flush=True,
+                )
+                return
+            decision = "FALLBACK_NEARFIELD"
+            print(
+                f"[barge-in] playback=True suppression={suppression_active} flush=False speech_ms={speech_ms} mic_rms={max_rms:.4f} idle_baseline={idle_baseline_str} eff_min_rms={effective_min_rms:.4f} corr=NA lag_ms=NA echo_floor={echo_floor:.4f} decision={decision}",
+                flush=True,
+            )
+        if suppression_active and max_rms <= (echo_floor * suppression_barge_mult):
+            decision = "NO_TRIGGER"
+            corr_str = f"{corr_val:.4f}" if corr_val is not None else "NA"
+            lag_str = str(lag_ms_val) if lag_ms_val is not None else "NA"
+            print(
+                f"[barge-in] playback=True suppression={suppression_active} flush=False speech_ms={speech_ms} mic_rms={max_rms:.4f} idle_baseline={idle_baseline_str} eff_min_rms={effective_min_rms:.4f} corr={corr_str} lag_ms={lag_str} echo_floor={echo_floor:.4f} decision={decision}",
+                flush=True,
+            )
+            return
+        corr_str = f"{corr_val:.4f}" if corr_val is not None else "NA"
+        lag_str = str(lag_ms_val) if lag_ms_val is not None else "NA"
+        print(
+            f"[barge-in] playback=True suppression={suppression_active} flush=False speech_ms={speech_ms} mic_rms={max_rms:.4f} idle_baseline={idle_baseline_str} eff_min_rms={effective_min_rms:.4f} corr={corr_str} lag_ms={lag_str} echo_floor={echo_floor:.4f} decision={decision}",
+            flush=True,
+        )
+        # Passed gate; continue to stop playback
         h = handle_ref[0]
         if h is not None and h.is_running():
             h.stop()
         handle_ref[0] = None
-        state_ref[0] = LISTENING
-        preroll = mic.get_preroll_frames()
-        last_f = vad_monitor.get_last_frame()
+        with speaker_lock:
+            speaker_pcm_ref[0] = None
+            playback_start_ts_ref[0] = None
+        baseline_freeze_rms_ref[0] = None
+        corr_echo_samples_ref[0] = []
+        corr_echo_ref[0] = None
+        # Do NOT start capture yet: flush mic and require fresh speech_start to avoid transcribing TTS leakage
+        state_ref[0] = IDLE
         listen_frames.clear()
-        listen_frames.extend(preroll)
-        if last_f:
-            listen_frames.append(last_f)
-        nonlocal bargein_debounce_frames
+        ignore_ms = int(os.environ.get("THREEPIO_POST_PLAYBACK_IGNORE_MS", str(POST_PLAYBACK_IGNORE_MS)))
+        nonlocal bargein_debounce_frames, post_playback_ignore_until_ts
         bargein_debounce_frames = int(
             os.environ.get("THREEPIO_BARGEIN_DEBOUNCE_FRAMES", "2")
         )
+        post_playback_ignore_until_ts = time.time() + (ignore_ms / 1000.0)
+        vad_monitor.set_baseline_freeze_until_ts(post_playback_ignore_until_ts)
+        vad_monitor.set_mode("listening")
         print("[barge-in] accepted, stopping playback (via=VADMonitor)", flush=True)
-        _status("Barge-in. Listening...")
+        print(f"[barge-in] stopped playback, flushing mic for {ignore_ms}ms", flush=True)
+        _status("Barge-in. Flushing mic...")
         if _debug_enabled():
             print("[ambient] barge-in -> LISTENING", flush=True)
 
@@ -514,23 +789,104 @@ def run_ambient(
         frame_bytes=VAD_BYTES_PER_FRAME,
         mode="listening",
         frame_queue=frame_queue,
+        mic_ring_buffer=mic_ring,
     )
     vad_monitor.start()
 
+    def _shutdown_handler(signum: int, _frame: Any) -> None:
+        sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT" if signum == signal.SIGINT else str(signum)
+        print(f"[ambient] shutdown requested ({sig_name})", flush=True)
+        shutdown_requested_ref[0] = True
+
+    try:
+        signal.signal(signal.SIGTERM, _shutdown_handler)
+        signal.signal(signal.SIGINT, _shutdown_handler)
+    except (ValueError, OSError):
+        pass  # main thread only; ignore on some platforms
+
     try:
         while True:
+            if shutdown_requested_ref[0]:
+                graceful_exit_ref[0] = True
+                break
             if state_ref[0] == SPEAKING:
+                # Playback active: do NOT run utterance capture or STT (prevents self-transcription of TTS). VADMonitor barge-in runs only when BARGE_IN_MODE=full.
                 state = SPEAKING
-                while handle_ref[0] is not None and handle_ref[0].is_running() and state_ref[0] == SPEAKING:
+                tty_saved = None
+                while (
+                    handle_ref[0] is not None
+                    and handle_ref[0].is_running()
+                    and state_ref[0] == SPEAKING
+                    and not shutdown_requested_ref[0]
+                ):
+                    barge_in_mode = (os.environ.get("BARGE_IN_MODE") or getattr(settings, "BARGE_IN_MODE", "full") or "full").strip().lower()
+                    if barge_in_mode == "assisted":
+                        try:
+                            import termios
+                            if tty_saved is None and sys.stdin.isatty():
+                                tty_saved = termios.tcgetattr(sys.stdin)
+                                new = list(tty_saved)
+                                new[3] = new[3] & ~(termios.ICANON | termios.ECHO)
+                                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, new)
+                            if tty_saved is not None:
+                                r, _, _ = select.select([sys.stdin], [], [], 0)
+                                if r:
+                                    ch = sys.stdin.read(1)
+                                    if ch in "\r\n ":
+                                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, tty_saved)
+                                        tty_saved = None
+                                        print("[barge-in] assisted_interrupt_triggered source=keypress", flush=True)
+                                        h = handle_ref[0]
+                                        if h is not None and h.is_running():
+                                            h.stop()
+                                        handle_ref[0] = None
+                                        state_ref[0] = IDLE
+                                        with speaker_lock:
+                                            speaker_pcm_ref[0] = None
+                                            playback_start_ts_ref[0] = None
+                                        baseline_freeze_rms_ref[0] = None
+                                        corr_echo_samples_ref[0] = []
+                                        corr_echo_ref[0] = None
+                                        listen_frames.clear()
+                                        ignore_ms = 350
+                                        post_playback_ignore_until_ts = time.time() + (ignore_ms / 1000.0)
+                                        vad_monitor.set_baseline_freeze_until_ts(post_playback_ignore_until_ts)
+                                        vad_monitor.set_mode("listening")
+                                        vad_monitor.set_speaking_start_ts(None)
+                                        print(f"[barge-in] stopped playback, flushing mic for {ignore_ms}ms", flush=True)
+                                        _status("Barge-in (assisted). Flushing mic...")
+                                        break
+                        except Exception:
+                            if tty_saved is not None:
+                                try:
+                                    import termios
+                                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, tty_saved)
+                                except Exception:
+                                    pass
+                                tty_saved = None
                     time.sleep(0.02)
+                if tty_saved is not None:
+                    try:
+                        import termios
+                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, tty_saved)
+                    except Exception:
+                        pass
                 if state_ref[0] == SPEAKING:
                     state_ref[0] = IDLE
                     state = IDLE
                     vad_monitor.set_mode("listening")
                     vad_monitor.set_speaking_start_ts(None)
                     handle_ref[0] = None
+                    with speaker_lock:
+                        speaker_pcm_ref[0] = None
+                        playback_start_ts_ref[0] = None
+                    baseline_freeze_rms_ref[0] = None
+                    corr_echo_samples_ref[0] = []
+                    corr_echo_ref[0] = None
                     _status("Idle.")
                     cooldown_until_ts = time.time() + (get_post_speech_cooldown_ms() / 1000.0)
+                    post_playback_drain_until_ts = time.time() + (POST_PLAYBACK_DRAIN_MS / 1000.0)
+                    vad_monitor.set_baseline_freeze_until_ts(post_playback_drain_until_ts)
                 if raw_path is not None and raw_path.exists():
                     raw_path.unlink(missing_ok=True)
 
@@ -549,7 +905,23 @@ def run_ambient(
             try:
                 frame = frame_queue.get(timeout=0.05)
             except queue.Empty:
+                if shutdown_requested_ref[0]:
+                    graceful_exit_ref[0] = True
+                    break
                 continue
+            # After playback ends, discard audio for POST_PLAYBACK_DRAIN_MS so we do not transcribe TTS echo
+            if post_playback_drain_until_ts is not None:
+                if time.time() < post_playback_drain_until_ts:
+                    continue
+                post_playback_drain_until_ts = None
+                vad_monitor.set_baseline_freeze_until_ts(None)
+            # After barge-in: flush mic and ignore VAD for post_playback_ignore_ms, then require fresh speech_start
+            if post_playback_ignore_until_ts is not None:
+                if time.time() < post_playback_ignore_until_ts:
+                    continue
+                post_playback_ignore_until_ts = None
+                vad_monitor.set_baseline_freeze_until_ts(None)
+                print("[barge-in] ready for new speech_start", flush=True)
             state = state_ref[0]
             preroll = mic.get_preroll_frames()
 
@@ -634,25 +1006,30 @@ def run_ambient(
                         )
                         print(
                             f"[ambient] speech_start rejected reason={reason} rms={rms:.4f} threshold={vad_start_rms} "
-                            f"cooldown_remaining_ms={cooldown_remaining_ms} device_index={resolved_device_index} sample_rate={VAD_SAMPLE_RATE}",
+                            f"cooldown_remaining_ms={cooldown_remaining_ms} device_index={idx} sample_rate={VAD_SAMPLE_RATE}",
                             flush=True,
                         )
                     continue
                 if speech_start:
                     if cooldown_until_ts is not None and now_ts < cooldown_until_ts:
-                        print("[ambient] trigger ignored (post-speech cooldown)", flush=True)
+                        if last_cooldown_log_at is None or (now_ts - last_cooldown_log_at) > 1.0:
+                            print("[ambient] trigger ignored (post-speech cooldown)", flush=True)
+                            last_cooldown_log_at = now_ts
                     else:
                         cooldown_until_ts = None
+                        last_cooldown_log_at = None
                         state = LISTENING
                         state_ref[0] = LISTENING
                         listen_frames = list(preroll) + [frame]
+                        utterance_ms_acc = 0
+                        silence_ms_acc = 0
                         _status("Listening...")
                         via = "webrtcvad" if vad_start else "energy"
                         print(f"[VAD] speech_start via={via} rms={rms:.4f}", flush=True)
                         if _debug_enabled():
                             print(
                                 f"[ambient] speech_start accepted rms={rms:.4f} threshold={vad_start_rms} "
-                                f"device_index={resolved_device_index} sample_rate={VAD_SAMPLE_RATE}",
+                                f"device_index={idx} sample_rate={VAD_SAMPLE_RATE}",
                                 flush=True,
                             )
                             print("[ambient] state=LISTENING (VAD speech start)", flush=True)
@@ -667,205 +1044,307 @@ def run_ambient(
                     listen_frames.append(frame)
                 if len(listen_frames) > max_listen_frames:
                     listen_frames = listen_frames[-max_listen_frames:]
-                vad_end = frame_ok_for_vad and detect_speech_end(
-                    listen_frames, silence_ms_threshold=silence_ms, current_rms=rms, current_peak=peak, log_event=False
-                )
-                energy_end_detected = energy_speech_end(rms_recent, silence_frames)
-                speech_end = vad_end or energy_end_detected
-                if speech_end:
-                    duration_sec = len(listen_frames) * (VAD_FRAME_MS / 1000.0)
-                    if duration_sec < min_utterance_sec:
-                        if _debug_enabled():
-                            print(f"[ambient] utterance too short: {duration_sec:.2f}s < {min_utterance_sec}s, not finalizing", flush=True)
-                        last_reject_ts = time.time()
-                        reject_cooldown_until_ts = last_reject_ts + (get_vad_cooldown_ms() / 1000.0)
-                        continue
-                    state = THINKING
-                    state_ref[0] = THINKING
-                    _status("Thinking...")
-                    via = "webrtcvad" if vad_end else "energy"
-                    print(f"[VAD] speech_end via={via} rms={rms:.4f}", flush=True)
-                    if _debug_enabled():
-                        print("[ambient] state=THINKING (VAD speech end)", flush=True)
-                    wav_path = Path(tempfile.gettempdir()) / f"ambient_{uuid.uuid4().hex[:12]}.wav"
-                    try:
-                        write_wav_frames(wav_path, listen_frames)
-                    except Exception as e:
-                        logger.exception("write_wav failed")
-                        _status(f"Record save failed: {e}")
-                        state = IDLE
-                        state_ref[0] = IDLE
-                        listen_frames = []
-                        continue
-                    try:
-                        user_text, _stt_info = transcribe_wav(wav_path, settings)
-                    except RuntimeError as e:
-                        _status(str(e))
-                        state = IDLE
-                        state_ref[0] = IDLE
-                        listen_frames = []
-                        wav_path.unlink(missing_ok=True)
-                        continue
-                    if not user_text:
-                        _status("No speech detected.")
-                        state = IDLE
-                        state_ref[0] = IDLE
-                        listen_frames = []
-                        last_reject_ts = time.time()
-                        reject_cooldown_until_ts = last_reject_ts + (get_vad_cooldown_ms() / 1000.0)
-                        wav_path.unlink(missing_ok=True)
-                        continue
-                    # Voice ID only after STT: require real speech and minimum duration
-                    duration_sec = len(listen_frames) * (VAD_FRAME_MS / 1000.0)
-                    min_voice_sec = float(os.environ.get("THREEPIO_VOICE_MIN_SEC", "0.9"))
-                    speaker_identity: str | None = None
-                    if duration_sec >= min_voice_sec:
-                        try:
-                            from threepio.identity.voice_id import (
-                                compute_embedding,
-                                load_voiceprints,
-                                match_speaker,
-                            )
-                            embedding = compute_embedding(wav_path)
-                            voiceprints = load_voiceprints()
-                            best_name, best_score, top = match_speaker(embedding, voiceprints, top_k=2)
-                            if best_name:
-                                speaker_identity = best_name
-                            if _debug_enabled():
-                                for n, s in top[:2]:
-                                    print(f"[ambient] voice_id top: {n!r} score={s:.4f}", flush=True)
-                                print(f"[ambient] voice_id applied={speaker_identity!r} duration_sec={duration_sec:.2f}", flush=True)
-                        except Exception as e:
-                            logger.debug("voice_id: %s", e)
-                    elif _debug_enabled():
-                        print(f"[ambient] voice_id skipped duration_sec={duration_sec:.2f} (min={min_voice_sec}) or no speech", flush=True)
-                    wav_path.unlink(missing_ok=True)
-                    print(f"You: {user_text}", flush=True)
-                    listen_frames = []
-
-                    # Build system and get reply (only final reply to TTS)
-                    state_obj = classify(user_text)
-                    profile = update_from_user_text(profile, user_text)
-                    if speaker_identity:
-                        if hasattr(profile, "model_copy"):
-                            profile = profile.model_copy(update={"name": speaker_identity})
-                        else:
-                            profile = {**profile, "name": speaker_identity}
-                    save_profile(profile, base_dir)
-                    if should_save_note(user_text):
-                        pair = extract_note_from_user_text(user_text)
-                        if pair and pair[0] is not None and pair[1] is not None:
-                            add_note(pair[0], pair[1])
-                    addr = extract_speaker_address(profile)
-                    if addr is not None:
-                        speaker_address = addr
-                    is_first = len(messages) == 0
-                    sys_content = build_c3po_system_prompt(profile, mode="ambient", user_text=user_text)
-                    now_ts = time.time()
-                    if get_preferred_address(profile) and should_inject_address(profile, now_ts, cooldown_s=90.0):
-                        mark_addressed(profile, now_ts)
-                        save_profile(profile, base_dir)
-                    formal_intent = interpret_user_intent(user_text)
-                    gloss = slang_to_formal_gloss(user_text)
-                    if formal_intent:
-                        user_content = (
-                            f"User intent (formal interpretation; do not repeat slang): {formal_intent}\n\n"
-                            f"User said: {user_text}"
-                        )
-                    elif gloss:
-                        user_content = (
-                            f"User slang gloss: {gloss} (do not reveal gloss unless asked)\n\n"
-                            f"User: {user_text}"
-                        )
-                    else:
-                        user_content = user_text
-                    if not messages or messages[0].get("role") != "system":
-                        messages.insert(0, {"role": "system", "content": sys_content})
-                    else:
-                        messages[0] = {"role": "system", "content": sys_content}
-                    messages.append({"role": "user", "content": user_content})
-                    _deflect = (
-                        getattr(state_obj, "name", None) == "DEFLECT"
-                        or (isinstance(state_obj, dict) and not state_obj.get("allow", True))
-                    )
-                    if _deflect:
-                        reply = "I am afraid I must remain in character as C-3PO."
-                    else:
-                        try:
-                            reply = generate_reply(messages, client=llm_client)
-                        except Exception as e:
-                            _status(f"LLM failed: {e}")
-                            messages.pop()
-                            state = IDLE
-                            state_ref[0] = IDLE
-                            continue
-                    if _debug_enabled():
-                        print("[LLM] requests_this_turn=1", flush=True)
-                    messages.append({"role": "assistant", "content": reply})
-                    # Keep system + last 10 user/assistant pairs
-                    max_turns = 10
-                    while len(messages) > 1 + max_turns * 2:
-                        # Drop oldest user or assistant message (keep system at 0)
-                        if len(messages) > 1:
-                            messages.pop(1)
-                    cleaned = apply_echo_guard(user_text, reply)
-                    display_text, speech_text = shape_for_speech(cleaned)
-                    print(f"C-3PO: {display_text}", flush=True)
-
-                    # Synthesize and apply FX (same pipeline as main, no echo)
-                    out_dir = Path("data/tts")
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    ext = ".mp3"
-                    raw_path = out_dir / f"ambient_{uuid.uuid4().hex[:12]}{ext}"
-                    try:
-                        synthesize_to_file(tts, speech_text, str(raw_path))
-                    except Exception as e:
-                        _status(f"TTS failed: {e}")
-                        state = IDLE
-                        state_ref[0] = IDLE
-                        continue
-                    playback_path = raw_path
-                    enable_fx = getattr(settings, "ENABLE_C3PO_FX", False)
-                    if not enable_fx:
-                        logger.debug("[fx] skipped (reason=disabled)")
-                    else:
-                        if not ffmpeg_checked_ref[0]:
-                            import shutil
-                            ffmpeg_checked_ref[0] = True
-                            ffmpeg_available_ref[0] = bool(shutil.which("ffmpeg"))
-                            if not ffmpeg_available_ref[0]:
-                                _status("ffmpeg not found. Install: brew install ffmpeg (macOS) or apt install ffmpeg (Linux). Set ENABLE_C3PO_FX=false to skip.")
-                        if not ffmpeg_available_ref[0]:
-                            logger.debug("[fx] skipped (reason=missing_ffmpeg)")
-                        else:
-                            logger.debug("[fx] applying")
-                            from threepio.speech.tts.c3po_fx import apply_c3po_fx
-                            processed = out_dir / f"ambient_fx_{uuid.uuid4().hex[:12]}.wav"
-                            try:
-                                apply_c3po_fx(str(raw_path), str(processed))
-                                playback_path = processed
-                            except Exception as e:
-                                logger.warning("[fx] skipped (reason=missing_fx_chain or error): %s", e)
-                    state = SPEAKING
-                    state_ref[0] = SPEAKING
-                    _status("Speaking...")
-                    if _debug_enabled():
-                        print("[ambient] state=SPEAKING", flush=True)
-                    # Suppression at exact moment playback starts: no barge-in / VAD finalization for THREEPIO_SPEECH_SUPPRESS_MS
-                    vad_monitor.set_mode("barge_in")
-                    suppress_ms = get_speech_suppress_ms()
-                    vad_monitor.set_speaking_start_ts(time.time())
-                    _status(f"speaking suppression active for {suppress_ms} ms")
-                    handle = play_audio_file_interruptible(playback_path)
-                    if handle is None:
-                        _status(NO_PLAYER_MESSAGE)
-                        state = IDLE
-                        state_ref[0] = IDLE
-                        continue
-                    handle_ref[0] = handle
+                # Utterance segmentation: silence hangover or max duration → finalize once (self-healing)
+                utterance_ms_acc += VAD_FRAME_MS
+                vad_is_speech = rms >= get_energy_end_threshold()
+                if vad_is_speech:
+                    silence_ms_acc = 0
+                else:
+                    silence_ms_acc += VAD_FRAME_MS
+                end_silence_ms = int(os.environ.get("UTTERANCE_END_SILENCE_MS", str(getattr(settings, "UTTERANCE_END_SILENCE_MS", 350))))
+                max_ms = int(os.environ.get("UTTERANCE_MAX_MS", str(getattr(settings, "UTTERANCE_MAX_MS", 2500))))
+                finalize_reason = None
+                if utterance_ms_acc >= max_ms:
+                    finalize_reason = "max_ms"
+                elif silence_ms_acc >= end_silence_ms:
+                    finalize_reason = "silence_hangover"
+                if not finalize_reason:
                     continue
+                # Finalize utterance once: run STT gate then either discard (→ IDLE) or STT → LLM (→ THINKING)
+                utterance_ms = len(listen_frames) * VAD_FRAME_MS
+                rms_list_utt = []
+                for fb in listen_frames:
+                    if len(fb) >= VAD_BYTES_PER_FRAME:
+                        rms_f, _ = frame_rms_peak(fb[:VAD_BYTES_PER_FRAME])
+                        rms_list_utt.append(rms_f)
+                avg_rms_utt = (sum(rms_list_utt) / len(rms_list_utt)) if rms_list_utt else 0.0
+                if finalize_reason == "max_ms":
+                    print(f"[vad] forced_end reason=max_ms ms={utterance_ms} rms={avg_rms_utt:.4f}", flush=True)
+                else:
+                    print(f"[vad] end reason=silence_hangover silence_ms={silence_ms_acc} utterance_ms={utterance_ms}", flush=True)
+                utterance_ms_acc = 0
+                silence_ms_acc = 0
+                duration_sec = len(listen_frames) * (VAD_FRAME_MS / 1000.0)
+                if duration_sec < min_utterance_sec:
+                    if _debug_enabled():
+                        print(f"[ambient] utterance too short: {duration_sec:.2f}s < {min_utterance_sec}s, not finalizing", flush=True)
+                    last_reject_ts = time.time()
+                    reject_cooldown_until_ts = last_reject_ts + (get_vad_cooldown_ms() / 1000.0)
+                    state = IDLE
+                    state_ref[0] = IDLE
+                    listen_frames = []
+                    continue
+                utterance_min_ms = int(os.environ.get("UTTERANCE_MIN_MS", str(getattr(settings, "UTTERANCE_MIN_MS", 450))))
+                utterance_min_rms = float(os.environ.get("UTTERANCE_MIN_RMS", str(getattr(settings, "UTTERANCE_MIN_RMS", 0.010))))
+                if utterance_ms < utterance_min_ms:
+                    print(f'[stt-gate] discard reason=min_ms ms={utterance_ms} rms={avg_rms_utt:.4f} text=""', flush=True)
+                    last_reject_ts = time.time()
+                    reject_cooldown_until_ts = last_reject_ts + (get_vad_cooldown_ms() / 1000.0)
+                    state = IDLE
+                    state_ref[0] = IDLE
+                    listen_frames = []
+                    continue
+                if avg_rms_utt < utterance_min_rms:
+                    print(f'[stt-gate] discard reason=min_rms ms={utterance_ms} rms={avg_rms_utt:.4f} text=""', flush=True)
+                    last_reject_ts = time.time()
+                    reject_cooldown_until_ts = last_reject_ts + (get_vad_cooldown_ms() / 1000.0)
+                    state = IDLE
+                    state_ref[0] = IDLE
+                    listen_frames = []
+                    continue
+                state = THINKING
+                state_ref[0] = THINKING
+                _status("Thinking...")
+                print(f"[VAD] speech_end via=segmentation rms={rms:.4f}", flush=True)
+                if _debug_enabled():
+                    print("[ambient] state=THINKING (utterance finalize)", flush=True)
+                wav_path = Path(tempfile.gettempdir()) / f"ambient_{uuid.uuid4().hex[:12]}.wav"
+                try:
+                    write_wav_frames(wav_path, listen_frames)
+                except Exception as e:
+                    logger.exception("write_wav failed")
+                    _status(f"Record save failed: {e}")
+                    state = IDLE
+                    state_ref[0] = IDLE
+                    listen_frames = []
+                    continue
+                try:
+                    user_text, _stt_info = transcribe_wav(wav_path, settings)
+                except RuntimeError as e:
+                    _status(str(e))
+                    state = IDLE
+                    state_ref[0] = IDLE
+                    listen_frames = []
+                    wav_path.unlink(missing_ok=True)
+                    continue
+                if not user_text:
+                    _status("No speech detected.")
+                    state = IDLE
+                    state_ref[0] = IDLE
+                    listen_frames = []
+                    last_reject_ts = time.time()
+                    reject_cooldown_until_ts = last_reject_ts + (get_vad_cooldown_ms() / 1000.0)
+                    wav_path.unlink(missing_ok=True)
+                    continue
+                utterance_min_words = int(os.environ.get("UTTERANCE_MIN_WORDS", str(getattr(settings, "UTTERANCE_MIN_WORDS", 2))))
+                junk_str = os.environ.get("UTTERANCE_JUNK_WORDS", str(getattr(settings, "UTTERANCE_JUNK_WORDS", "you,yeah,uh,um,hmm,hey")))
+                junk_set = {w.strip().lower() for w in junk_str.split(",") if w.strip()}
+                words = user_text.split()
+                if len(words) < utterance_min_words and user_text.strip().lower() in junk_set:
+                    text_snip = (user_text[:80] or "").replace('"', "'")
+                    print(f'[stt-gate] discard reason=junk_single ms={utterance_ms} rms={avg_rms_utt:.4f} text="{text_snip}"', flush=True)
+                    state = IDLE
+                    state_ref[0] = IDLE
+                    listen_frames = []
+                    last_reject_ts = time.time()
+                    reject_cooldown_until_ts = last_reject_ts + (get_vad_cooldown_ms() / 1000.0)
+                    wav_path.unlink(missing_ok=True)
+                    continue
+                # Voice ID only after STT: require real speech and minimum duration
+                duration_sec = len(listen_frames) * (VAD_FRAME_MS / 1000.0)
+                min_voice_sec = float(os.environ.get("THREEPIO_VOICE_MIN_SEC", "0.9"))
+                speaker_identity: str | None = None
+                if duration_sec >= min_voice_sec:
+                    try:
+                        from threepio.identity.voice_id import (
+                            compute_embedding,
+                            load_voiceprints,
+                            match_speaker,
+                        )
+                        embedding = compute_embedding(wav_path)
+                        voiceprints = load_voiceprints()
+                        best_name, best_score, top = match_speaker(embedding, voiceprints, top_k=2)
+                        if best_name:
+                            speaker_identity = best_name
+                        if _debug_enabled():
+                            for n, s in top[:2]:
+                                print(f"[ambient] voice_id top: {n!r} score={s:.4f}", flush=True)
+                            print(f"[ambient] voice_id applied={speaker_identity!r} duration_sec={duration_sec:.2f}", flush=True)
+                    except Exception as e:
+                        logger.debug("voice_id: %s", e)
+                elif _debug_enabled():
+                    print(f"[ambient] voice_id skipped duration_sec={duration_sec:.2f} (min={min_voice_sec}) or no speech", flush=True)
+                wav_path.unlink(missing_ok=True)
+                print(f"You: {user_text}", flush=True)
+                listen_frames = []
+
+                # Build system and get reply (only final reply to TTS)
+                state_obj = classify(user_text)
+                profile = update_from_user_text(profile, user_text)
+                if speaker_identity:
+                    if hasattr(profile, "model_copy"):
+                        profile = profile.model_copy(update={"name": speaker_identity})
+                    else:
+                        profile = {**profile, "name": speaker_identity}
+                save_profile(profile, base_dir)
+                if should_save_note(user_text):
+                    pair = extract_note_from_user_text(user_text)
+                    if pair and pair[0] is not None and pair[1] is not None:
+                        add_note(pair[0], pair[1])
+                addr = extract_speaker_address(profile)
+                if addr is not None:
+                    speaker_address = addr
+                is_first = len(messages) == 0
+                sys_content = build_c3po_system_prompt(profile, mode="ambient", user_text=user_text)
+                now_ts = time.time()
+                if get_preferred_address(profile) and should_inject_address(profile, now_ts, cooldown_s=90.0):
+                    mark_addressed(profile, now_ts)
+                    save_profile(profile, base_dir)
+                formal_intent = interpret_user_intent(user_text)
+                gloss = slang_to_formal_gloss(user_text)
+                if formal_intent:
+                    user_content = (
+                        f"User intent (formal interpretation; do not repeat slang): {formal_intent}\n\n"
+                        f"User said: {user_text}"
+                    )
+                elif gloss:
+                    user_content = (
+                        f"User slang gloss: {gloss} (do not reveal gloss unless asked)\n\n"
+                        f"User: {user_text}"
+                    )
+                else:
+                    user_content = user_text
+                if not messages or messages[0].get("role") != "system":
+                    messages.insert(0, {"role": "system", "content": sys_content})
+                else:
+                    messages[0] = {"role": "system", "content": sys_content}
+                messages.append({"role": "user", "content": user_content})
+                _deflect = (
+                    getattr(state_obj, "name", None) == "DEFLECT"
+                    or (isinstance(state_obj, dict) and not state_obj.get("allow", True))
+                )
+                if _deflect:
+                    reply = "I am afraid I must remain in character as C-3PO."
+                else:
+                    try:
+                        reply = generate_reply(messages, client=llm_client)
+                    except Exception as e:
+                        _status(f"LLM failed: {e}")
+                        messages.pop()
+                        state = IDLE
+                        state_ref[0] = IDLE
+                        continue
+                if _debug_enabled():
+                    print("[LLM] requests_this_turn=1", flush=True)
+                messages.append({"role": "assistant", "content": reply})
+                # Keep system + last 10 user/assistant pairs
+                max_turns = 10
+                while len(messages) > 1 + max_turns * 2:
+                    # Drop oldest user or assistant message (keep system at 0)
+                    if len(messages) > 1:
+                        messages.pop(1)
+                cleaned = apply_echo_guard(user_text, reply)
+                display_text, speech_text = shape_for_speech(cleaned)
+                print(f"C-3PO: {display_text}", flush=True)
+
+                # Synthesize and apply FX (same pipeline as main, no echo)
+                out_dir = Path("data/tts")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                ext = ".mp3"
+                raw_path = out_dir / f"ambient_{uuid.uuid4().hex[:12]}{ext}"
+                try:
+                    synthesize_to_file(tts, speech_text, str(raw_path))
+                except Exception as e:
+                    _status(f"TTS failed: {e}")
+                    state = IDLE
+                    state_ref[0] = IDLE
+                    continue
+                playback_path = raw_path
+                enable_fx = getattr(settings, "ENABLE_C3PO_FX", False)
+                if not enable_fx:
+                    logger.debug("[fx] skipped (reason=disabled)")
+                else:
+                    if not ffmpeg_checked_ref[0]:
+                        import shutil
+                        ffmpeg_checked_ref[0] = True
+                        ffmpeg_available_ref[0] = bool(shutil.which("ffmpeg"))
+                        if not ffmpeg_available_ref[0]:
+                            _status("ffmpeg not found. Install: brew install ffmpeg (macOS) or apt install ffmpeg (Linux). Set ENABLE_C3PO_FX=false to skip.")
+                    if not ffmpeg_available_ref[0]:
+                        logger.debug("[fx] skipped (reason=missing_ffmpeg)")
+                    else:
+                        logger.debug("[fx] applying")
+                        from threepio.speech.tts.c3po_fx import apply_c3po_fx
+                        processed = out_dir / f"ambient_fx_{uuid.uuid4().hex[:12]}.wav"
+                        try:
+                            apply_c3po_fx(str(raw_path), str(processed))
+                            playback_path = processed
+                        except Exception as e:
+                            logger.warning("[fx] skipped (reason=missing_fx_chain or error): %s", e)
+                state = SPEAKING
+                state_ref[0] = SPEAKING
+                barge_in_mode = (os.environ.get("BARGE_IN_MODE") or getattr(settings, "BARGE_IN_MODE", "full") or "full").strip().lower()
+                print(f"[barge-in] mode={barge_in_mode}", flush=True)
+                if barge_in_mode in ("off", "assisted"):
+                    print(f"[barge-in] playback mic_processing=disabled reason={barge_in_mode}", flush=True)
+                _status("Speaking...")
+                if _debug_enabled():
+                    print("[ambient] state=SPEAKING", flush=True)
+                # Suppression at exact moment playback starts: no barge-in / VAD finalization for THREEPIO_SPEECH_SUPPRESS_MS
+                vad_monitor.set_mode("barge_in")
+                _bf = vad_monitor.get_baseline_rms()
+                _floor = get_barge_in_baseline_floor()
+                baseline_freeze_rms_ref[0] = max(_bf, _floor) if _bf is not None else None
+                if baseline_freeze_rms_ref[0] is not None:
+                    print(f"[barge-in] baseline_freeze start={baseline_freeze_rms_ref[0]:.4f}", flush=True)
+                suppress_ms = get_speech_suppress_ms()
+                pcm = _decode_audio_to_pcm_16k(playback_path)
+                t0 = time.time()
+                _corr_win = int(os.environ.get("BARGE_IN_CORR_WINDOW_MS", str(getattr(settings, "BARGE_IN_CORR_WINDOW_MS", 200))))
+                _corr_sweep = int(os.environ.get("BARGE_IN_CORR_LAG_SWEEP_MS", str(getattr(settings, "BARGE_IN_CORR_LAG_SWEEP_MS", 60))))
+                _N = int(CORR_SAMPLE_RATE * _corr_win / 1000)
+                _sweep = int(CORR_SAMPLE_RATE * _corr_sweep / 1000)
+                _spk_need = _N + 2 * _sweep
+                print(
+                    f"[barge-in] corr_debug mic_sr={CORR_SAMPLE_RATE} spk_sr={CORR_SAMPLE_RATE} N={_N} sweep={_sweep} mic_required={_N} spk_required={_spk_need}",
+                    flush=True,
+                )
+                with speaker_lock:
+                    speaker_pcm_ref[0] = pcm if getattr(pcm, "size", 0) > 0 else None
+                    playback_start_ts_ref[0] = t0
+                vad_monitor.set_speaking_start_ts(t0)
+                _status(f"speaking suppression active for {suppress_ms} ms")
+                handle = play_audio_file_interruptible(playback_path)
+                if handle is None:
+                    _status(NO_PLAYER_MESSAGE)
+                    state = IDLE
+                    state_ref[0] = IDLE
+                    baseline_freeze_rms_ref[0] = None
+                    corr_echo_samples_ref[0] = []
+                    corr_echo_ref[0] = None
+                    continue
+                handle_ref[0] = handle
+                continue
 
     except KeyboardInterrupt:
+        graceful_exit_ref[0] = True
         _status("Stopping.")
     finally:
+        logger.info("Shutdown: stopping playback")
+        print("[ambient] shutdown: stopping playback...", flush=True)
+        h = handle_ref[0]
+        if h is not None and h.is_running():
+            h.stop()
+            handle_ref[0] = None
+        logger.info("Shutdown: stopping VAD monitor")
+        print("[ambient] shutdown: stopping VAD monitor...", flush=True)
+        try:
+            vad_monitor.stop()
+        except Exception as e:
+            logger.debug("vad_monitor.stop: %s", e)
+        logger.info("Shutdown: closing mic stream")
+        print("[ambient] shutdown: closing mic stream...", flush=True)
         mic.stop()
+        logger.info("Shutdown complete")
+        print("[ambient] shutdown complete.", flush=True)
+    return 0 if graceful_exit_ref[0] else 1

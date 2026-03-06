@@ -55,6 +55,11 @@ def _parse_args():
         action="store_true",
         help="Run interactive profile setup and exit",
     )
+    parser.add_argument(
+        "--list-audio-devices",
+        action="store_true",
+        help="List available audio input devices and exit.",
+    )
     return parser.parse_known_args()
 
 
@@ -168,6 +173,17 @@ def _run_ambient(settings: Any, device_in: int | None = None, vad_threshold: flo
     return ambient_run(settings, device_in=device_in, vad_threshold=vad_threshold)
 
 
+def _run_list_audio_devices() -> None:
+    """Print audio input devices (max_input_channels > 0) to stdout."""
+    from threepio.audio.devices import format_input_devices, list_input_devices
+
+    devs = list_input_devices()
+    if not devs:
+        print("No audio input devices found.", flush=True)
+    else:
+        print(format_input_devices(devs), flush=True)
+
+
 def main() -> NoReturn:
     """Parse CLI; run --healthcheck, --tts-test, or --ambient before other modes, else run app."""
     args, _ = _parse_args()
@@ -176,6 +192,9 @@ def main() -> NoReturn:
         profile = prompt_profile()
         save_profile_file(profile)
         return
+    if getattr(args, "list_audio_devices", False):
+        _run_list_audio_devices()
+        sys.exit(0)
     profile = load_or_prompt_profile()
     if getattr(args, "healthcheck", False):
         code = _run_healthcheck()

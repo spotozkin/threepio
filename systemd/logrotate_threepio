@@ -1,0 +1,8 @@
+/var/log/threepio/*.log {
+    daily
+    rotate 7
+    compress
+    copytruncate
+    missingok
+    notifempty
+}

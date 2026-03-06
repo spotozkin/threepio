@@ -6,7 +6,7 @@ Under pytest we do not load .env, so tests are hermetic.
 """
 
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -125,12 +125,50 @@ class Settings(BaseSettings):
 
     # VAD / ambient capture
     MIN_UTTERANCE_SEC: float = Field(default=1.2, ge=0.1, le=30.0, description="Minimum speech duration (sec) before finalizing; clips shorter are not sent to STT")
+    # Utterance quality gate (before STT and after STT)
+    UTTERANCE_MIN_MS: int = Field(default=450, ge=0, le=10000, description="Min utterance length (ms) before STT; shorter discarded")
+    UTTERANCE_MIN_RMS: float = Field(default=0.010, ge=0.0, le=0.5, description="Min avg RMS over utterance; below this discard before STT")
+    UTTERANCE_MIN_WORDS: int = Field(default=2, ge=1, le=20, description="Min word count; single-word junk tokens discarded after STT")
+    UTTERANCE_JUNK_WORDS: str = Field(default="you,yeah,uh,um,hmm,hey", description="Comma-separated junk tokens; single-word matches discarded after STT")
+    UTTERANCE_END_SILENCE_MS: int = Field(default=350, ge=50, le=2000, description="Consecutive silence (ms) to end utterance and run STT gate")
+    UTTERANCE_MAX_MS: int = Field(default=2500, ge=500, le=30000, description="Max utterance length (ms); force finalize and run STT gate")
+    BARGE_IN_MODE: Literal["off", "assisted", "full"] = Field(default="full", description="Barge-in: off (no mic processing during playback) | assisted (keypress/GPIO only) | full (correlation barge-in)")
+    BARGE_IN_MIN_SPEECH_MS: int = Field(default=250, ge=0, le=5000, description="Min consecutive speech (ms) to accept barge-in during playback")
+    BARGE_IN_MIN_RMS: float = Field(default=0.0, ge=0.0, le=1.0, description="Optional floor for barge-in RMS; 0 = use only echo-baseline gate")
+    BARGE_IN_BASELINE_WINDOW_MS: int = Field(default=250, ge=50, le=2000, description="Rolling window (ms) for echo baseline RMS during SPEAKING")
+    BARGE_IN_MARGIN_MULT: float = Field(default=2.5, ge=0.5, le=10.0, description="Echo gate: effective_min_rms >= baseline_rms * this (when not during playback)")
+    BARGE_IN_MARGIN_ADD: float = Field(default=0.012, ge=0.0, le=0.5, description="Echo gate: effective_min_rms >= baseline_rms + this (when not during playback)")
+    BARGE_IN_MARGIN_MULT_PLAYBACK: float = Field(default=1.6, ge=0.5, le=10.0, description="Barge-in gate during TTS playback: eff_min_rms = idle_baseline * this + ADD_PLAYBACK")
+    BARGE_IN_MARGIN_ADD_PLAYBACK: float = Field(default=0.010, ge=0.0, le=0.5, description="Barge-in gate during TTS playback: additive term for eff_min_rms")
+    BARGE_IN_BASELINE_FLOOR: float = Field(default=0.006, ge=0.0, le=0.5, description="Minimum idle baseline RMS; prevents baseline collapse")
+    BARGE_IN_PLAYBACK_ECHO_FLOOR: float = Field(default=0.070, ge=0.0, le=0.5, description="Conservative fallback when correlation unavailable; min mic_rms to allow barge-in")
+    BARGE_IN_SUPPRESSION_BARGE_MULT: float = Field(default=1.35, ge=1.0, le=3.0, description="During speaking suppression: barge-in only if mic_rms > echo_floor * this")
+    # Correlation-gated barge-in (mic vs speaker PCM)
+    BARGE_IN_CORR_WINDOW_MS: int = Field(default=200, ge=50, le=500, description="Window ms for mic/speaker correlation")
+    BARGE_IN_CORR_LAG_SWEEP_MS: int = Field(default=60, ge=0, le=200, description="Lag sweep ±ms for correlation")
+    BARGE_IN_CORR_LAG_STEP_MS: int = Field(default=10, ge=1, le=50, description="Lag step ms")
+    BARGE_IN_CORR_BLOCK_THRESH: float = Field(default=0.65, ge=0.0, le=1.0, description="Correlation >= this -> BLOCK (echo)")
+    BARGE_IN_CORR_ALLOW_THRESH: float = Field(default=0.45, ge=0.0, le=1.0, description="Correlation <= this -> allow if RMS+duration pass")
+    BARGE_IN_CORR_UNCERTAIN_RMS_MULT: float = Field(default=1.25, ge=1.0, le=3.0, description="When correlation uncertain: require mic_rms >= eff_min_rms * this")
+    BARGE_IN_CORR_CONFIDENT_MIN: float = Field(default=0.15, ge=0.0, le=1.0, description="Correlation below this treated as unreliable; use FALLBACK_ECHO_FLOOR")
+    BARGE_IN_PLAYBACK_WARMUP_MS: int = Field(default=350, ge=0, le=2000, description="First N ms of playback: do not allow FALLBACK_ECHO_FLOOR barge-in unless mic_rms >= echo_floor*1.5")
+    # Legacy echo-baseline (fixed window); superseded by rolling baseline
+    BARGE_IN_ECHO_BASELINE_MS: int = Field(default=200, ge=0, le=2000, description="(Legacy) Baseline ms after playback start for echo gate")
+    BARGE_IN_ECHO_MARGIN: float = Field(default=1.8, ge=0.5, le=5.0, description="(Legacy) Echo gate margin multiplier")
+    BARGE_IN_ECHO_ADD_RMS: float = Field(default=0.010, ge=0.0, le=0.5, description="(Legacy) Additive RMS for echo gate threshold")
 
     # Streaming chat (threepio.chat.streaming_chat)
     CHAT_MAX_TURNS: int = Field(default=40, ge=1, le=500, description="Max conversation turns before trimming")
     CHAT_SUMMARY_EVERY: int = Field(default=8, ge=1, le=100, description="Summarize every N turns")
     CHAT_PERSONA: str = Field(default="", description="Optional persona hint for conversation manager")
     CHAT_MODE: Literal["fast", "long"] = Field(default="fast", description="fast=short replies, long=allow longer")
+
+    @field_validator("BARGE_IN_MODE", mode="before")
+    @classmethod
+    def normalize_barge_in_mode(cls, v: Any) -> str:
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
 
 
 @lru_cache

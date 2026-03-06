@@ -99,6 +99,22 @@ def run_startup_checks(
     report["playback_mode"] = audio_mode
     report["stt_model"] = (getattr(settings, "STT_MODEL", None) or "").strip() or "(default)"
     report["enable_c3po_fx"] = bool(getattr(settings, "ENABLE_C3PO_FX", False))
+    if hasattr(settings, "BARGE_IN_MODE"):
+        report["barge_in_mode"] = getattr(settings, "BARGE_IN_MODE", "full")
+    if hasattr(settings, "BARGE_IN_MIN_SPEECH_MS"):
+        report["barge_in_min_speech_ms"] = getattr(settings, "BARGE_IN_MIN_SPEECH_MS", 450)
+    if hasattr(settings, "BARGE_IN_MIN_RMS"):
+        report["barge_in_min_rms"] = getattr(settings, "BARGE_IN_MIN_RMS", 0.03)
+    if hasattr(settings, "BARGE_IN_ECHO_BASELINE_MS"):
+        report["barge_in_echo_baseline_ms"] = getattr(settings, "BARGE_IN_ECHO_BASELINE_MS", 200)
+    if hasattr(settings, "BARGE_IN_ECHO_MARGIN"):
+        report["barge_in_echo_margin"] = getattr(settings, "BARGE_IN_ECHO_MARGIN", 1.8)
+    if hasattr(settings, "BARGE_IN_ECHO_ADD_RMS"):
+        report["barge_in_echo_add_rms"] = getattr(settings, "BARGE_IN_ECHO_ADD_RMS", 0.010)
+    if hasattr(settings, "UTTERANCE_END_SILENCE_MS"):
+        report["utterance_end_silence_ms"] = getattr(settings, "UTTERANCE_END_SILENCE_MS", 350)
+    if hasattr(settings, "UTTERANCE_MAX_MS"):
+        report["utterance_max_ms"] = getattr(settings, "UTTERANCE_MAX_MS", 2500)
     if audio_mode != "print" and not playback_bin:
         report["errors"].append(
             f"AUDIO_OUTPUT_MODE={audio_mode} but no playback binary found (afplay/ffplay/aplay/mpg123 or use print)"
@@ -138,6 +154,22 @@ def print_report(report: dict[str, Any], verbose: bool = False) -> None:
     print(f"  PROVIDER_TTS: {p.get('tts', '')}", flush=True)
     print(f"  STT model: {report.get('stt_model', '')}", flush=True)
     print(f"  ENABLE_C3PO_FX: {report.get('enable_c3po_fx', False)}", flush=True)
+    if "barge_in_mode" in report:
+        print(f"  BARGE_IN_MODE: {report['barge_in_mode']}", flush=True)
+    if "barge_in_min_speech_ms" in report:
+        print(f"  BARGE_IN_MIN_SPEECH_MS: {report['barge_in_min_speech_ms']}", flush=True)
+    if "barge_in_min_rms" in report:
+        print(f"  BARGE_IN_MIN_RMS: {report['barge_in_min_rms']}", flush=True)
+    if "barge_in_echo_baseline_ms" in report:
+        print(f"  BARGE_IN_ECHO_BASELINE_MS: {report['barge_in_echo_baseline_ms']}", flush=True)
+    if "barge_in_echo_margin" in report:
+        print(f"  BARGE_IN_ECHO_MARGIN: {report['barge_in_echo_margin']}", flush=True)
+    if "barge_in_echo_add_rms" in report:
+        print(f"  BARGE_IN_ECHO_ADD_RMS: {report['barge_in_echo_add_rms']}", flush=True)
+    if "utterance_end_silence_ms" in report:
+        print(f"  UTTERANCE_END_SILENCE_MS: {report['utterance_end_silence_ms']}", flush=True)
+    if "utterance_max_ms" in report:
+        print(f"  UTTERANCE_MAX_MS: {report['utterance_max_ms']}", flush=True)
     for rel, ok in report.get("dirs", {}).items():
         print(f"  dir {rel}: {'ok' if ok else 'FAIL'}", flush=True)
     for err in report.get("errors", []):

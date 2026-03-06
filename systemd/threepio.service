@@ -1,0 +1,18 @@
+[Unit]
+Description=THREEPIO ambient voice assistant
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/threepio
+EnvironmentFile=/home/pi/threepio/config/pi.env
+ExecStart=/home/pi/threepio/systemd/threepio_wrapper.sh
+Restart=always
+RestartSec=2
+StandardOutput=append:/var/log/threepio/ambient.log
+StandardError=append:/var/log/threepio/ambient.log
+
+[Install]
+WantedBy=multi-user.target

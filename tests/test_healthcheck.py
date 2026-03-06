@@ -201,3 +201,35 @@ def test_cli_healthcheck_exit_0_with_mock_providers() -> None:
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "Healthcheck" in result.stdout
+
+
+def test_healthcheck_output_includes_barge_in_settings() -> None:
+    """When env sets barge-in tuning vars, healthcheck printed output includes those values."""
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(_SRC),
+        "PROVIDER_TTS": "mock",
+        "PROVIDER_STT": "mock",
+        "PROVIDER_LLM": "mock",
+        "AUDIO_OUTPUT_MODE": "print",
+        "BARGE_IN_MIN_SPEECH_MS": "250",
+        "BARGE_IN_MIN_RMS": "0.015",
+        "BARGE_IN_ECHO_BASELINE_MS": "200",
+        "BARGE_IN_ECHO_MARGIN": "1.8",
+        "BARGE_IN_ECHO_ADD_RMS": "0.01",
+    }
+    result = subprocess.run(
+        [sys.executable, "-m", "threepio.main", "--healthcheck"],
+        capture_output=True,
+        text=True,
+        cwd=_ROOT,
+        env=env,
+        timeout=15,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    out = result.stdout
+    assert "250" in out
+    assert "0.015" in out
+    assert "200" in out
+    assert "1.8" in out
+    assert "0.01" in out

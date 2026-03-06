@@ -52,67 +52,71 @@ def _device_info_from_query(sd: Any, device_index: int) -> tuple[str, int, float
     return (name, max_in, default_sr)
 
 
-def resolve_audio_input_device(raw_override: str | None = None) -> tuple[int | None, str]:
-    """
-    Resolve to (device_index, device_name). Uses THREEPIO_AUDIO_INPUT_DEVICE unless
-    raw_override is provided.
-    - Numeric string (e.g. "1", "3"): treat as integer device index; name from query_devices(idx).
-    - Non-numeric string: substring match on device name (case-insensitive); only consider
-      devices with max_input_channels > 0; first match wins.
-    - Unset/empty: use default input device.
-    Always returns (int | None, str). When found, device_index is an int for use with
-    query_devices(resolved_index) and InputStream(device=resolved_index).
-    """
-    try:
-        import sounddevice as sd
-    except ImportError:
-        return (None, "<default (sounddevice not loaded)>")
-
-    raw = raw_override if raw_override is not None else os.environ.get("THREEPIO_AUDIO_INPUT_DEVICE", "").strip()
-    if not raw:
-        try:
-            default = sd.default.device[0]
-            default = int(default)
-            name, _, _ = _device_info_from_query(sd, default)
-            return (default, name)
-        except Exception:
-            return (None, "<default>")
-
-    # Numeric string → integer device index
-    if raw.strip().isdigit():
-        try:
-            idx = int(raw)
-            name, _, _ = _device_info_from_query(sd, idx)
-            return (idx, name)
-        except Exception:
-            return (None, "<invalid index?>")
-
-    # Non-numeric: substring match on device names; only input-capable devices (max_input_channels > 0)
-    sub = raw.lower()
+def _get_input_capable_devices(sd: Any) -> list[tuple[int, str]]:
+    """Return list of (index, name) for devices with max_input_channels > 0."""
     try:
         devices = sd.query_devices()
         try:
             devices = list(devices)
         except Exception:
             devices = [devices]
-        for i, dev in enumerate(devices):
-            max_in = getattr(dev, "max_input_channels", 0)
-            try:
-                max_in = int(max_in)
-            except (TypeError, ValueError):
-                max_in = 0
-            if max_in <= 0:
-                continue
-            dev_name = getattr(dev, "name", None) or ""
-            dev_name = (dev_name or "").strip()
-            if not dev_name:
-                continue
-            if sub in dev_name.lower():
-                name = dev_name or f"device {i}"
-                return (int(i), name)
-    except Exception as e:
-        logger.debug("resolve_audio_input_device list: %s", e)
-    return (None, f"<no match for '{raw}'>")
+    except Exception:
+        return []
+    result: list[tuple[int, str]] = []
+    for i, dev in enumerate(devices):
+        max_in = getattr(dev, "max_input_channels", 0)
+        try:
+            max_in = int(max_in)
+        except (TypeError, ValueError):
+            max_in = 0
+        if max_in <= 0:
+            continue
+        name = getattr(dev, "name", None) or ""
+        name = (name or "").strip() or f"device {i}"
+        result.append((i, name))
+    return result
+
+
+def resolve_audio_input_device(device_env_value: str | None) -> int:
+    """
+    Resolve audio input device to an integer index. Uses sounddevice.query_devices();
+    only devices with max_input_channels > 0 are considered.
+    - None or empty: return index of first available input device; else raise RuntimeError.
+    - Digit string (e.g. "1"): treat as index; validate it exists; return it; else raise.
+    - Non-numeric: substring match (case-insensitive) on device name; return first match; else raise with available list.
+    """
+    import sounddevice as sd  # noqa: PLC0415
+
+    input_devices = _get_input_capable_devices(sd)
+    if not input_devices:
+        raise RuntimeError("No audio input devices found")
+
+    raw = (device_env_value or "").strip()
+
+    if not raw:
+        idx, name = input_devices[0]
+        logger.info("Resolved audio input device: index=%s name=%s", idx, name)
+        return idx
+
+    if raw.isdigit():
+        idx = int(raw)
+        for i, name in input_devices:
+            if i == idx:
+                logger.info("Resolved audio input device: index=%s name=%s", idx, name)
+                return idx
+        available = ", ".join(f"{i} ({n})" for i, n in input_devices)
+        raise RuntimeError(
+            "Invalid audio input device index %s; no input-capable device at that index. Available: %s"
+            % (idx, available)
+        )
+
+    sub = raw.lower()
+    for i, name in input_devices:
+        if sub in name.lower():
+            logger.info("Resolved audio input device: index=%s name=%s", i, name)
+            return i
+    available = ", ".join(f"{i} ({n})" for i, n in input_devices)
+    raise RuntimeError("No audio input device matching %r. Available: %s" % (raw, available))
 
 
 def frame_rms_peak(frame: bytes) -> tuple[float, float]:
