@@ -264,6 +264,43 @@ def _load_semantic_filter_fn() -> Any:
         return lambda text: ""
 
 
+def _resample_wav_for_stt(src_path: Path) -> Path:
+    """Resample WAV to mono 16 kHz PCM for STT. Returns temp path on success, else ``src_path``."""
+    src_path = Path(src_path)
+    if not src_path.exists():
+        return src_path
+    fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="threepio_stt_")
+    os.close(fd)
+    out_path = Path(tmp)
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(src_path),
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                str(out_path),
+            ],
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size < 128:
+            out_path.unlink(missing_ok=True)
+            return src_path
+        return out_path
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        try:
+            out_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return src_path
+
+
 def transcribe_wav(path: Path, settings: Any) -> tuple[str, Any]:
     """
     Transcribe WAV file to text. Uses local faster-whisper with STT_* settings.
@@ -278,10 +315,13 @@ def transcribe_wav(path: Path, settings: Any) -> tuple[str, Any]:
     if language == "":
         language = None
     beam_size = getattr(settings, "STT_BEAM_SIZE", 1)
+    stt_path = _resample_wav_for_stt(path)
     try:
         from threepio.speech.stt.local_whisper import transcribe as local_whisper_transcribe
         stt_t0 = time.perf_counter()
-        text, info = local_whisper_transcribe(path, model_size=model_size, language=language, beam_size=beam_size)
+        text, info = local_whisper_transcribe(
+            stt_path, model_size=model_size, language=language, beam_size=beam_size
+        )
         print(f"[perf] stt_sec={time.perf_counter() - stt_t0:.3f}", flush=True)
         detected = getattr(info, "language", None)
         logger.debug(
@@ -305,6 +345,12 @@ def transcribe_wav(path: Path, settings: Any) -> tuple[str, Any]:
                 "Then run again."
             ) from e
         raise
+    finally:
+        if stt_path.resolve() != path.resolve():
+            try:
+                stt_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def run_vad_test(device_in: int | None = None, duration_sec: float = 10.0) -> None:
@@ -453,6 +499,16 @@ def run_ambient(
     state = IDLE
 
     settings = get_settings()
+    print("[ambient] warming STT model...", flush=True)
+    try:
+        stt_model_size = getattr(settings, "STT_MODEL", "tiny.en")
+        from threepio.speech.stt.local_whisper import ensure_model_loaded
+
+        ensure_model_loaded(stt_model_size)
+        print("[ambient] STT warm-up complete", flush=True)
+    except Exception as e:
+        logger.warning("[ambient] STT warm-up failed: %s", e)
+        print(f"[ambient] STT warm-up skipped: {e}", flush=True)
     tts = get_tts_provider()
     try:
         llm_client = get_llm_client()
