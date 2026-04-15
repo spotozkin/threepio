@@ -273,14 +273,16 @@ def transcribe_wav(path: Path, settings: Any) -> tuple[str, Any]:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"WAV not found: {path}")
-    model_size = getattr(settings, "STT_MODEL", "small")
+    model_size = getattr(settings, "STT_MODEL", "tiny")
     language = getattr(settings, "STT_LANGUAGE", "en")
     if language == "":
         language = None
-    beam_size = getattr(settings, "STT_BEAM_SIZE", 5)
+    beam_size = getattr(settings, "STT_BEAM_SIZE", 1)
     try:
         from threepio.speech.stt.local_whisper import transcribe as local_whisper_transcribe
+        stt_t0 = time.perf_counter()
         text, info = local_whisper_transcribe(path, model_size=model_size, language=language, beam_size=beam_size)
+        print(f"[perf] stt_sec={time.perf_counter() - stt_t0:.3f}", flush=True)
         detected = getattr(info, "language", None)
         logger.debug(
             "[ambient] stt model=%s language=%s transcript=%s",
