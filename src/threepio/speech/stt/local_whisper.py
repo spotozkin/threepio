@@ -37,7 +37,7 @@ def transcribe(
     global _model, _model_size
     if _model is None or _model_size != model_size:
         logger.info("[local_whisper] loading model %s", model_size)
-        _model = WhisperModel(model_size)
+        _model = WhisperModel(model_size, device="cpu", compute_type="int8")
         _model_size = model_size
     segments, info = _model.transcribe(str(path), language=language, beam_size=beam_size)
     text = " ".join(s.text.strip() for s in segments if s.text).strip()

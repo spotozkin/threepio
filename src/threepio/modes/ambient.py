@@ -273,7 +273,7 @@ def transcribe_wav(path: Path, settings: Any) -> tuple[str, Any]:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"WAV not found: {path}")
-    model_size = getattr(settings, "STT_MODEL", "tiny")
+    model_size = getattr(settings, "STT_MODEL", "tiny.en")
     language = getattr(settings, "STT_LANGUAGE", "en")
     if language == "":
         language = None
