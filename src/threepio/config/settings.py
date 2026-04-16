@@ -62,6 +62,22 @@ class Settings(BaseSettings):
             return "auto"
         return str(v) if v is not None else "auto"
 
+    THREEPIO_PLAYBACK_GAIN: float = Field(
+        default=7.0,
+        description="Linear gain for ffplay volume filter (THREEPIO_PLAYBACK_GAIN). Invalid/missing values fall back to 7.0.",
+    )
+
+    @field_validator("THREEPIO_PLAYBACK_GAIN", mode="before")
+    @classmethod
+    def _coerce_playback_gain(cls, v: Any) -> Any:
+        if v is None or v == "":
+            return 7.0
+        try:
+            g = float(v)
+            return g if g > 0 else 7.0
+        except (TypeError, ValueError):
+            return 7.0
+
     # Realtime voice (OpenAI Realtime API - optional)
     PROVIDER_VOICE: Literal["cli", "realtime"] = Field(
         default="cli", description="cli=text input, realtime=OpenAI Realtime API voice mode"

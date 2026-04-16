@@ -82,6 +82,32 @@ def get_audio_output_mode() -> str:
     return resolve_audio_output_mode()
 
 
+def _merge_ffplay_af(existing_chain: str | None, gain: float) -> str:
+    """Append ``volume=<gain>`` to an optional existing ffmpeg audio filter graph."""
+    vol = f"volume={gain}"
+    if existing_chain and str(existing_chain).strip():
+        return f"{str(existing_chain).strip()},{vol}"
+    return vol
+
+
+def _get_playback_gain() -> float:
+    """THREEPIO_PLAYBACK_GAIN (settings or env); invalid or unusable → 7.0."""
+    try:
+        from threepio.config import get_settings
+
+        g = float(get_settings().THREEPIO_PLAYBACK_GAIN)
+        return g if g > 0 else 7.0
+    except Exception:
+        raw = (os.environ.get("THREEPIO_PLAYBACK_GAIN") or "").strip()
+        if not raw:
+            return 7.0
+        try:
+            g = float(raw)
+            return g if g > 0 else 7.0
+        except ValueError:
+            return 7.0
+
+
 def _which(cmd: str) -> str | None:
     """Return path to executable or None."""
     import shutil
@@ -126,10 +152,13 @@ def get_playback_command_with_mode(path: str | Path, mode: str) -> Tuple[list[st
     is_darwin = sys.platform == "darwin"
     suffix = _suffix(path)
 
-    def prefer_ffplay() -> list[str] | None:
-        if _which("ffplay"):
-            return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", str(path)]
-        return None
+    def prefer_ffplay(existing_af: str | None = None) -> list[str] | None:
+        ff = _which("ffplay")
+        if not ff:
+            return None
+        gain = _get_playback_gain()
+        af = _merge_ffplay_af(existing_af, gain)
+        return [ff, "-nodisp", "-autoexit", "-loglevel", "error", "-af", af, str(path)]
 
     def prefer_aplay() -> list[str] | None:
         if suffix in ("wav", "") and _which("aplay"):
@@ -168,13 +197,13 @@ def get_playback_command_with_mode(path: str | Path, mode: str) -> Tuple[list[st
             return ([afplay_path, str(path)], "afplay")
         return (None, "afplay(unavailable)")
     if sys.platform.startswith("linux"):
-        # Linux: aplay → ffplay → mpg123
-        cmd = prefer_aplay()
-        if cmd:
-            return (cmd, "aplay")
+        # Linux: ffplay (gain via -af volume) → aplay → mpg123
         cmd = prefer_ffplay()
         if cmd:
             return (cmd, "ffplay")
+        cmd = prefer_aplay()
+        if cmd:
+            return (cmd, "aplay")
         cmd = prefer_mpg123()
         if cmd:
             return (cmd, "mpg123")
@@ -207,7 +236,7 @@ def resolve_player_binary(mode: str) -> Optional[str]:
     if sys.platform == "darwin":
         return _which("afplay")
     if sys.platform.startswith("linux"):
-        for cmd in ("aplay", "ffplay", "mpg123"):
+        for cmd in ("ffplay", "aplay", "mpg123"):
             path = _which(cmd)
             if path:
                 return path
