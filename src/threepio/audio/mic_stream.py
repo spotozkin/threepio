@@ -1,4 +1,4 @@
-"""Microphone capture with pre-roll ring buffer. Mono 16 kHz PCM int16."""
+"""Microphone capture with pre-roll ring buffer. Device capture at 48 kHz; frames decimated to mono 16 kHz PCM int16 for VAD."""
 
 from __future__ import annotations
 
@@ -13,16 +13,19 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Hardware capture rate; decimated in the callback to SAMPLE_RATE for VAD/STT pipeline alignment.
+CAPTURE_SAMPLE_RATE = 48000
 SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "int16"
 BYTES_PER_SAMPLE = 2
 
-# Pre-roll: last 300ms. At 16kHz, 300ms = 4800 samples = 9600 bytes.
+# Pre-roll: last 300ms. At 16 kHz pipeline rate, 300ms = 4800 samples = 9600 bytes.
 # Frame size for VAD (webrtcvad): 10/20/30 ms at 16kHz. We use 30ms = 480 samples = 960 bytes.
 FRAME_MS = 30
 SAMPLES_PER_FRAME = int(SAMPLE_RATE * FRAME_MS / 1000)
 BYTES_PER_FRAME = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE
+CAPTURE_SAMPLES_PER_BLOCK = int(CAPTURE_SAMPLE_RATE * FRAME_MS / 1000)
 PRE_ROLL_MS = 300
 PRE_ROLL_FRAMES = PRE_ROLL_MS // FRAME_MS  # 10 frames
 
@@ -52,67 +55,71 @@ def _device_info_from_query(sd: Any, device_index: int) -> tuple[str, int, float
     return (name, max_in, default_sr)
 
 
-def resolve_audio_input_device(raw_override: str | None = None) -> tuple[int | None, str]:
-    """
-    Resolve to (device_index, device_name). Uses THREEPIO_AUDIO_INPUT_DEVICE unless
-    raw_override is provided.
-    - Numeric string (e.g. "1", "3"): treat as integer device index; name from query_devices(idx).
-    - Non-numeric string: substring match on device name (case-insensitive); only consider
-      devices with max_input_channels > 0; first match wins.
-    - Unset/empty: use default input device.
-    Always returns (int | None, str). When found, device_index is an int for use with
-    query_devices(resolved_index) and InputStream(device=resolved_index).
-    """
-    try:
-        import sounddevice as sd
-    except ImportError:
-        return (None, "<default (sounddevice not loaded)>")
-
-    raw = raw_override if raw_override is not None else os.environ.get("THREEPIO_AUDIO_INPUT_DEVICE", "").strip()
-    if not raw:
-        try:
-            default = sd.default.device[0]
-            default = int(default)
-            name, _, _ = _device_info_from_query(sd, default)
-            return (default, name)
-        except Exception:
-            return (None, "<default>")
-
-    # Numeric string → integer device index
-    if raw.strip().isdigit():
-        try:
-            idx = int(raw)
-            name, _, _ = _device_info_from_query(sd, idx)
-            return (idx, name)
-        except Exception:
-            return (None, "<invalid index?>")
-
-    # Non-numeric: substring match on device names; only input-capable devices (max_input_channels > 0)
-    sub = raw.lower()
+def _get_input_capable_devices(sd: Any) -> list[tuple[int, str]]:
+    """Return list of (index, name) for devices with max_input_channels > 0."""
     try:
         devices = sd.query_devices()
         try:
             devices = list(devices)
         except Exception:
             devices = [devices]
-        for i, dev in enumerate(devices):
-            max_in = getattr(dev, "max_input_channels", 0)
-            try:
-                max_in = int(max_in)
-            except (TypeError, ValueError):
-                max_in = 0
-            if max_in <= 0:
-                continue
-            dev_name = getattr(dev, "name", None) or ""
-            dev_name = (dev_name or "").strip()
-            if not dev_name:
-                continue
-            if sub in dev_name.lower():
-                name = dev_name or f"device {i}"
-                return (int(i), name)
-    except Exception as e:
-        logger.debug("resolve_audio_input_device list: %s", e)
-    return (None, f"<no match for '{raw}'>")
+    except Exception:
+        return []
+    result: list[tuple[int, str]] = []
+    for i, dev in enumerate(devices):
+        max_in = getattr(dev, "max_input_channels", 0)
+        try:
+            max_in = int(max_in)
+        except (TypeError, ValueError):
+            max_in = 0
+        if max_in <= 0:
+            continue
+        name = getattr(dev, "name", None) or ""
+        name = (name or "").strip() or f"device {i}"
+        result.append((i, name))
+    return result
+
+
+def resolve_audio_input_device(device_env_value: str | None) -> int:
+    """
+    Resolve audio input device to an integer index. Uses sounddevice.query_devices();
+    only devices with max_input_channels > 0 are considered.
+    - None or empty: return index of first available input device; else raise RuntimeError.
+    - Digit string (e.g. "1"): treat as index; validate it exists; return it; else raise.
+    - Non-numeric: substring match (case-insensitive) on device name; return first match; else raise with available list.
+    """
+    import sounddevice as sd  # noqa: PLC0415
+
+    input_devices = _get_input_capable_devices(sd)
+    if not input_devices:
+        raise RuntimeError("No audio input devices found")
+
+    raw = (device_env_value or "").strip()
+
+    if not raw:
+        idx, name = input_devices[0]
+        logger.info("Resolved audio input device: index=%s name=%s", idx, name)
+        return idx
+
+    if raw.isdigit():
+        idx = int(raw)
+        for i, name in input_devices:
+            if i == idx:
+                logger.info("Resolved audio input device: index=%s name=%s", idx, name)
+                return idx
+        available = ", ".join(f"{i} ({n})" for i, n in input_devices)
+        raise RuntimeError(
+            "Invalid audio input device index %s; no input-capable device at that index. Available: %s"
+            % (idx, available)
+        )
+
+    sub = raw.lower()
+    for i, name in input_devices:
+        if sub in name.lower():
+            logger.info("Resolved audio input device: index=%s name=%s", i, name)
+            return i
+    available = ", ".join(f"{i} ({n})" for i, n in input_devices)
+    raise RuntimeError("No audio input device matching %r. Available: %s" % (raw, available))
 
 
 def frame_rms_peak(frame: bytes) -> tuple[float, float]:
@@ -132,13 +139,14 @@ def frame_rms_peak(frame: bytes) -> tuple[float, float]:
 
 
 class MicStream:
-    """Capture mono 16 kHz PCM via sounddevice.InputStream; pre-roll ring buffer. Frames are exactly BYTES_PER_FRAME (960) for VAD."""
+    """Capture mono 48 kHz from device; decimate to 16 kHz frames for pre-roll and queue. Frames are exactly BYTES_PER_FRAME (960) for VAD."""
 
     def __init__(self, device: int | None = None, block_duration_ms: int = FRAME_MS) -> None:
         self._device = device  # int or None for default
         self._block_duration_ms = block_duration_ms
-        self._block_size = int(SAMPLE_RATE * block_duration_ms / 1000) * BYTES_PER_SAMPLE  # 960 for 30ms
-        self._blocksize_samples = self._block_size // BYTES_PER_SAMPLE  # 480 for 30ms
+        self._block_size = int(SAMPLE_RATE * block_duration_ms / 1000) * BYTES_PER_SAMPLE  # 960 for 30ms @ 16kHz output
+        self._blocksize_samples = self._block_size // BYTES_PER_SAMPLE  # 480 for 30ms @ 16kHz
+        self._capture_block_samples = int(CAPTURE_SAMPLE_RATE * block_duration_ms / 1000)  # 1440 for 30ms @ 48kHz
         self._ring: deque[bytes] = deque(maxlen=PRE_ROLL_FRAMES)
         self._lock = threading.Lock()
         self._stream = None
@@ -148,7 +156,7 @@ class MicStream:
         self._last_indata_dtype: Any = None
 
     def _audio_callback(self, indata: Any, frames: int, time: Any, status: Any) -> None:
-        """Callback for sounddevice.InputStream: build int16 mono bytes (exactly BYTES_PER_FRAME) and put in queue."""
+        """Callback: 48 kHz int16 mono -> decimate by 3 to 16 kHz, emit exactly BYTES_PER_FRAME bytes."""
         import numpy as np
         self._last_indata_dtype = getattr(indata, "dtype", None)
         arr = np.asarray(indata).reshape(-1)
@@ -157,7 +165,16 @@ class MicStream:
             arr = (np.clip(arr.astype(np.float64), -1.0, 1.0) * 32767).astype(np.int16)
         else:
             arr = arr.astype(np.int16, copy=False)
-        frame_bytes = arr.tobytes()
+        n_cap = self._capture_block_samples
+        if len(arr) < n_cap:
+            arr = np.pad(arr, (0, n_cap - len(arr)), mode="constant")
+        elif len(arr) > n_cap:
+            arr = arr[:n_cap]
+        # 48 kHz -> 16 kHz: average each triplet (simple low-pass before decimation)
+        arr_f = arr.astype(np.float64)
+        dec = (arr_f[0::3] + arr_f[1::3] + arr_f[2::3]) / 3.0
+        out = np.clip(np.round(dec), -32768, 32767).astype(np.int16)
+        frame_bytes = out.tobytes()
         if len(frame_bytes) > BYTES_PER_FRAME:
             frame_bytes = frame_bytes[:BYTES_PER_FRAME]
         elif len(frame_bytes) < BYTES_PER_FRAME:
@@ -168,7 +185,7 @@ class MicStream:
             pass
 
     def _get_stream(self):
-        """Lazy-init capture stream: sounddevice.InputStream with device=resolved int, 16kHz mono int16, blocksize 480."""
+        """Lazy-init capture stream: 48 kHz mono int16, blocksize 1440 samples per 30 ms; callback emits 16 kHz frames."""
         if self._stream is not None:
             return self._stream
         try:
@@ -192,18 +209,19 @@ class MicStream:
             "max_input_channels": max_ch,
             "default_samplerate": default_sr,
             "sample_rate": SAMPLE_RATE,
+            "capture_sample_rate": CAPTURE_SAMPLE_RATE,
             "dtype": DTYPE,
             "channels": CHANNELS,
-            "frames_per_buffer": self._blocksize_samples,
+            "frames_per_buffer": self._capture_block_samples,
             "frame_duration_ms": self._block_duration_ms,
         }
-        # InputStream: known-good format for VAD (mono 16kHz int16, 30ms frames); device=int
+        # InputStream: 48 kHz capture; callback decimates to 16 kHz frames for VAD
         stream = sd.InputStream(
             device=dev,
-            samplerate=SAMPLE_RATE,
+            samplerate=CAPTURE_SAMPLE_RATE,
             channels=CHANNELS,
             dtype=DTYPE,
-            blocksize=self._blocksize_samples,
+            blocksize=self._capture_block_samples,
             callback=self._audio_callback,
         )
         self._stream = stream

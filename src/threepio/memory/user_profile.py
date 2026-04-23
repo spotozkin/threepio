@@ -38,6 +38,25 @@ class UserProfile(BaseModel):
     pronouns: Optional[str] = None
 
 
+def format_address(address: str | None) -> str | None:
+    """Normalize address: whitespace, collapse duplicated consecutive words (case-insensitive)."""
+    if address is None:
+        return None
+    s = re.sub(r"\s+", " ", (address or "").strip())
+    if not s:
+        return None
+    tokens = s.split()
+    out: list[str] = []
+    prev_lower: str | None = None
+    for tok in tokens:
+        low = tok.lower()
+        if prev_lower is not None and low == prev_lower:
+            continue
+        out.append(tok)
+        prev_lower = low
+    return " ".join(out) if out else None
+
+
 def get_profile_path(base_dir: str | Path = ".") -> Path:
     """Resolve path to project-local profile file. Prefer .threepio/profile.json."""
     return Path(base_dir).resolve() / PROFILE_DIR / PROFILE_FILENAME
@@ -163,28 +182,24 @@ def get_preferred_address(profile: UserProfile | None) -> str | None:
     if profile is None:
         return None
     if profile.preferred_address and profile.preferred_address.strip():
-        return profile.preferred_address.strip()
+        return format_address(profile.preferred_address.strip())
     style = (profile.address_style or "neutral").lower()
     if style == "none":
         return None
     if style == "custom" and profile.custom_address:
-        return profile.custom_address.strip()
+        return format_address(profile.custom_address.strip())
     name = (profile.display_name or profile.name or "").strip()
     if style == "master":
-        return f"Master {name}" if name else "Master"
+        return format_address(f"Master {name}" if name else "Master")
     if style == "sir":
-        return "sir"
+        return format_address("sir")
     if style == "maam":
-        return "ma'am"
+        return format_address("ma'am")
     if style == "neutral":
-        if name and name.lower() == "sam":
-            return "Master Sam"  # legacy
         if name:
-            return name
-    if profile.name and profile.name.strip().lower() == "sam":
-        return "Master Sam"
+            return format_address(name)
     if profile.name and profile.name.strip():
-        return profile.name.strip()
+        return format_address(profile.name.strip())
     return None
 
 

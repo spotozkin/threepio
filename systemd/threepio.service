@@ -7,12 +7,12 @@ Wants=network-online.target
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/threepio
-EnvironmentFile=/home/pi/threepio/.env
-ExecStart=/home/pi/threepio/.venv/bin/python -m threepio --ambient
+EnvironmentFile=/home/pi/threepio/config/pi.env
+ExecStart=/home/pi/threepio/systemd/threepio_wrapper.sh
 Restart=always
 RestartSec=2
-StandardOutput=journal
-StandardError=journal
+StandardOutput=append:/var/log/threepio/ambient.log
+StandardError=append:/var/log/threepio/ambient.log
 
 [Install]
 WantedBy=multi-user.target

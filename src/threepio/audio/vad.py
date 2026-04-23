@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 from queue import Queue, Full, Empty
-from typing import Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,11 @@ def _energy_end_threshold() -> float:
         return 0.003
 
 
+def get_energy_end_threshold() -> float:
+    """Listening-phase silence threshold; frame with rms below this is considered silence."""
+    return _energy_end_threshold()
+
+
 # Speaking-phase thresholds and timing (avoid self-trigger from TTS playback)
 def get_energy_start_speaking() -> float:
     v = os.environ.get("THREEPIO_ENERGY_START_SPEAKING", "0.030").strip()
@@ -52,12 +57,12 @@ def get_energy_end_speaking() -> float:
 
 
 def get_speech_suppress_ms() -> int:
-    """Suppression window (ms) after playback start during which barge-in is ignored. Default 2000."""
-    v = os.environ.get("THREEPIO_SPEECH_SUPPRESS_MS", "2000").strip()
+    """Short suppression (ms) after playback start; barge-in then uses evidence (min speech + min RMS). Default 400."""
+    v = os.environ.get("THREEPIO_SPEECH_SUPPRESS_MS", "400").strip()
     try:
         return max(0, int(v))
     except ValueError:
-        return 2000
+        return 400
 
 
 def is_speaking_suppression_active(
@@ -154,6 +159,76 @@ def get_bargein_rms_multiplier() -> float:
         return 2.0
 
 
+def get_barge_in_min_speech_ms() -> int:
+    """Min consecutive speech (ms) to accept barge-in. From settings or env. Default 250."""
+    try:
+        from threepio.config import get_settings
+        return get_settings().BARGE_IN_MIN_SPEECH_MS
+    except Exception:
+        pass
+    v = os.environ.get("BARGE_IN_MIN_SPEECH_MS", os.environ.get("THREEPIO_BARGE_IN_MIN_SPEECH_MS", "250")).strip()
+    try:
+        return max(0, int(v))
+    except ValueError:
+        return 250
+
+
+def get_barge_in_min_rms() -> float:
+    """Min max RMS during speech streak to accept barge-in. From settings or env. Default 0 (not required; echo gate used)."""
+    try:
+        from threepio.config import get_settings
+        return get_settings().BARGE_IN_MIN_RMS
+    except Exception:
+        pass
+    v = os.environ.get("THREEPIO_BARGE_IN_MIN_RMS", "0").strip()
+    try:
+        return max(0.0, float(v))
+    except ValueError:
+        return 0.0
+
+
+def get_barge_in_baseline_window_ms() -> int:
+    """Rolling window (ms) for echo baseline RMS during SPEAKING. From settings or env. Default 250."""
+    try:
+        from threepio.config import get_settings
+        return get_settings().BARGE_IN_BASELINE_WINDOW_MS
+    except Exception:
+        pass
+    v = os.environ.get("BARGE_IN_BASELINE_WINDOW_MS", os.environ.get("THREEPIO_BARGE_IN_BASELINE_WINDOW_MS", "250")).strip()
+    try:
+        return max(50, min(2000, int(v)))
+    except ValueError:
+        return 250
+
+
+def get_barge_in_baseline_floor() -> float:
+    """Minimum idle baseline RMS; prevents baseline collapse. From settings or env. Default 0.006."""
+    try:
+        from threepio.config import get_settings
+        return get_settings().BARGE_IN_BASELINE_FLOOR
+    except Exception:
+        pass
+    v = os.environ.get("BARGE_IN_BASELINE_FLOOR", os.environ.get("THREEPIO_BARGE_IN_BASELINE_FLOOR", "0.006")).strip()
+    try:
+        return max(0.0, float(v))
+    except ValueError:
+        return 0.006
+
+
+def get_barge_in_echo_baseline_ms() -> int:
+    """Baseline window ms after playback start for echo gate. From settings or env. Default 200."""
+    try:
+        from threepio.config import get_settings
+        return get_settings().BARGE_IN_ECHO_BASELINE_MS
+    except Exception:
+        pass
+    v = os.environ.get("THREEPIO_BARGE_IN_ECHO_BASELINE_MS", "200").strip()
+    try:
+        return max(0, int(v))
+    except ValueError:
+        return 200
+
+
 def energy_bargein_confirmed(rms_recent: Sequence[float], confirm_frames: int) -> bool:
     """True if RMS has been above ENERGY_START_SPEAKING for at least confirm_frames consecutive frames."""
     if confirm_frames < 1 or len(rms_recent) < confirm_frames:
@@ -215,14 +290,23 @@ def _count_consecutive_speech_frames_from_tail(
     frames: Sequence[bytes], rms_list: Sequence[float], energy_th: float
 ) -> int:
     """Count consecutive frames from the end that are speech (VAD or RMS >= energy_th). Returns 0 if not enough data."""
+    count, _ = _count_consecutive_speech_and_max_rms(frames, rms_list, energy_th)
+    return count
+
+
+def _count_consecutive_speech_and_max_rms(
+    frames: Sequence[bytes], rms_list: Sequence[float], energy_th: float
+) -> tuple[int, float]:
+    """Consecutive speech frames from tail and max RMS in that streak. Returns (0, 0.0) if no data."""
     if not frames or not rms_list or len(frames) != len(rms_list):
-        return 0
+        return (0, 0.0)
     try:
         vad = _get_vad()
     except RuntimeError:
         vad = None
     n = len(frames)
     count = 0
+    max_rms = 0.0
     for i in range(n - 1, -1, -1):
         frame = frames[i]
         rms = rms_list[i] if i < len(rms_list) else 0.0
@@ -234,7 +318,9 @@ def _count_consecutive_speech_frames_from_tail(
         if not is_speech:
             break
         count += 1
-    return count
+        if rms > max_rms:
+            max_rms = rms
+    return (count, max_rms)
 
 
 def vad_bargein_confirmed(frames: Sequence[bytes], confirm_frames: int) -> bool:
@@ -384,13 +470,14 @@ class VADMonitor:
     def __init__(
         self,
         read_frame: Callable[[], bytes | None],
-        on_speech_start: Callable[[], None],
+        on_speech_start: Callable[..., None],
         on_speech_end: Callable[[], None],
         *,
         silence_ms: int = 700,
         frame_bytes: int = VAD_BYTES_PER_FRAME,
         mode: Literal["listening", "barge_in"] = "listening",
         frame_queue: Queue[bytes] | None = None,
+        mic_ring_buffer: Any = None,
     ) -> None:
         self._read_frame = read_frame
         self._on_speech_start = on_speech_start
@@ -399,6 +486,7 @@ class VADMonitor:
         self._frame_bytes = frame_bytes
         self._mode = mode
         self._frame_queue = frame_queue
+        self._mic_ring_buffer = mic_ring_buffer
         self._silence_frames = max(1, silence_ms // VAD_FRAME_MS)
         self._frames: deque[bytes] = deque(maxlen=100)
         self._rms_recent: deque[float] = deque(maxlen=50)
@@ -407,25 +495,50 @@ class VADMonitor:
         self._thread: threading.Thread | None = None
         self._last_frame: bytes | None = None
         self._speaking_start_ts: float | None = None
+        self._baseline_rms: float | None = None
+        # Idle baseline: snapshot when entering barge_in; used for gate during playback (never updated while playback active)
+        self._baseline_idle_rms: float | None = None
+        # Freeze baseline updates until this timestamp (e.g. during post_playback flush)
+        self._baseline_freeze_until_ts: float | None = None
+        # Rolling echo baseline: (timestamp, rms) for last BARGE_IN_BASELINE_WINDOW_MS; baseline_rms = max(rms in window)
+        self._echo_baseline_deque: deque[tuple[float, float]] = deque()
 
     def set_speaking_start_ts(self, ts: float | None) -> None:
-        """Set playback start time for barge_in suppression. None to clear."""
+        """Set playback start time for barge_in suppression. None to clear. Resets baseline RMS collection."""
         self._speaking_start_ts = ts
         if ts is not None:
             self._in_speech = False
+            self._baseline_rms = None
+            self._echo_baseline_deque.clear()
+
+    def set_baseline_freeze_until_ts(self, ts: float | None) -> None:
+        """Freeze baseline updates until timestamp (e.g. during post_playback flush). None = no freeze."""
+        self._baseline_freeze_until_ts = ts
 
     def set_mode(self, mode: Literal["listening", "barge_in"]) -> None:
         """Switch between listening (full VAD) and barge_in (confirm + suppress)."""
         if mode != self._mode:
+            if mode == "barge_in":
+                floor = get_barge_in_baseline_floor()
+                # Snapshot idle baseline before playback; clamp to floor to prevent collapse
+                self._baseline_idle_rms = max(self._baseline_rms if self._baseline_rms is not None else 0.0, floor)
             self._mode = mode
             # Reset latch and buffers on mode switch
             self._in_speech = False
             self._frames.clear()
             self._rms_recent.clear()
+            if mode == "barge_in":
+                self._echo_baseline_deque.clear()
 
     def get_last_frame(self) -> bytes | None:
         """Last frame read; used by ambient to seed listen_frames on barge-in."""
         return self._last_frame
+
+    def get_baseline_rms(self) -> float | None:
+        """During barge_in: last clean idle baseline (for gate). During listening: current rolling baseline."""
+        if self._mode == "barge_in":
+            return self._baseline_idle_rms
+        return self._baseline_rms
 
     def start(self) -> None:
         """Spawn thread that reads frames and calls on_speech_start / on_speech_end."""
@@ -463,47 +576,72 @@ class VADMonitor:
                         pass
             rms, peak = frame_rms_peak(frame)
             self._rms_recent.append(rms)
+            if self._mic_ring_buffer is not None and len(frame) >= self._frame_bytes:
+                import numpy as np
+                samples = np.frombuffer(frame[: self._frame_bytes], dtype=np.int16)
+                samples_f32 = samples.astype(np.float32) / 32768.0
+                self._mic_ring_buffer.append(samples_f32)
             list_frames = list(self._frames)
             rms_list = list(self._rms_recent)
 
             if self._mode == "barge_in":
+                # Do NOT update baseline during playback (prevents baseline poisoning by TTS leakage)
                 suppress_ms = get_speech_suppress_ms()
                 elapsed_ms = (
                     (time.time() - self._speaking_start_ts) * 1000
                     if self._speaking_start_ts is not None
                     else suppress_ms + 1
                 )
-                suppression_remaining_ms = max(0, int(suppress_ms - elapsed_ms))
-                if elapsed_ms < suppress_ms:
-                    continue
-                # Stricter barge-in: require sustained speech for N frames AND rms >= threshold * multiplier
-                sustained_frames = get_bargein_sustained_frames()
-                rms_mult = get_bargein_rms_multiplier()
-                start_rms = get_vad_start_rms()
-                rms_threshold = start_rms * rms_mult
+                suppression_active = elapsed_ms < suppress_ms
+                # Evidence-based barge-in: run even during suppression; callback applies stricter gate when suppression_active
+                min_speech_ms = get_barge_in_min_speech_ms()
+                min_rms = get_barge_in_min_rms()
                 energy_th = get_energy_start_speaking()
-                consecutive = _count_consecutive_speech_frames_from_tail(
+                consecutive, max_rms_in_streak = _count_consecutive_speech_and_max_rms(
                     list_frames, rms_list, energy_th
                 )
-                sustained_ok = consecutive >= sustained_frames
-                rms_ok = rms >= rms_threshold
+                consecutive_ms = consecutive * VAD_FRAME_MS
                 speech_started = (
-                    len(frame) >= self._frame_bytes and sustained_ok and rms_ok
+                    len(frame) >= self._frame_bytes
+                    and consecutive_ms >= min_speech_ms
+                    and max_rms_in_streak >= min_rms
                 )
                 if speech_started and not self._in_speech:
                     self._in_speech = True
                     if _debug_enabled():
                         print(
-                            f"[ambient] barge-in accepted sustained_frames={consecutive} rms={rms:.4f} threshold={rms_threshold:.4f} suppression_remaining_ms={suppression_remaining_ms}",
+                            f"[ambient] barge-in accepted consecutive_ms={consecutive_ms} max_rms={max_rms_in_streak:.4f} suppression={suppression_active} (min_speech_ms={min_speech_ms} min_rms={min_rms})",
                             flush=True,
                         )
                     try:
-                        self._on_speech_start()
+                        self._on_speech_start(int(consecutive_ms), float(max_rms_in_streak), suppression_active)
                     except Exception as e:
                         logger.debug("VADMonitor on_speech_start: %s", e)
                 if not speech_started:
                     self._in_speech = False
                 continue
+
+            # Listening mode: update rolling baseline only when not in post_playback flush, not speech, and rms >= floor
+            allow_baseline_update = (
+                (self._baseline_freeze_until_ts is None or time.time() >= self._baseline_freeze_until_ts)
+                and rms >= get_barge_in_baseline_floor()
+            )
+            if allow_baseline_update:
+                vad_is_speech = (
+                    detect_speech_start(list_frames, current_rms=rms, current_peak=peak, log_event=False)
+                    or energy_speech_start(rms_list, 3)
+                )
+                if not vad_is_speech:
+                    now = time.time()
+                    window_ms = get_barge_in_baseline_window_ms()
+                    self._echo_baseline_deque.append((now, rms))
+                    while self._echo_baseline_deque and (now - self._echo_baseline_deque[0][0]) * 1000 > window_ms:
+                        self._echo_baseline_deque.popleft()
+                    if self._echo_baseline_deque:
+                        self._baseline_rms = max(rms for _, rms in self._echo_baseline_deque)
+                        self._baseline_rms = max(self._baseline_rms, get_barge_in_baseline_floor())
+                    else:
+                        self._baseline_rms = None
 
             speech_started = (
                 len(frame) >= self._frame_bytes

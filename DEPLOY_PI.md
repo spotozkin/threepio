@@ -73,9 +73,9 @@ ELEVENLABS_VOICE_ID=...
 
 ```bash
 cd /home/pi/threepio && source .venv/bin/activate
-python -m src.threepio.main --tts-test
-python -m src.threepio.main --mic-test
-python -m src.threepio.main --ambient
+python -m threepio --tts-test
+python -m threepio --mic-test
+python -m threepio --ambient
 # Ctrl+C to stop
 ```
 
@@ -90,7 +90,7 @@ sudo systemctl enable threepio
 sudo systemctl start threepio
 ```
 
-The service runs: `/home/pi/threepio/.venv/bin/python -m src.threepio.main --ambient` with `EnvironmentFile=/home/pi/threepio/.env`.
+The service runs: `/home/pi/threepio/.venv/bin/python -m threepio --ambient` with `EnvironmentFile=/home/pi/threepio/.env`.
 
 ---
 
