@@ -16,4 +16,4 @@ fi
 
 "$ROOT/scripts/pi_net_wait_and_chime.sh" "$ROOT" || true
 
-exec "$ROOT/.venv/bin/python" -m src.threepio.main --ambient
+exec "$ROOT/.venv/bin/python" -m threepio --ambient
