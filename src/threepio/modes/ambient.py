@@ -564,7 +564,8 @@ def run_ambient(
         print("[ambient] state=IDLE", flush=True)
 
     listen_frames: list[bytes] = []
-    max_listen_frames = 300  # ~9s cap
+    max_listen_ms = int(os.environ.get("THREEPIO_MAX_LISTEN_MS", "20000"))
+    max_listen_frames = max(1, max_listen_ms // VAD_FRAME_MS)
     debug_frame_count = 0
     silent_seconds = 0.0
     last_level_time = None
