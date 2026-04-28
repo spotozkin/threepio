@@ -54,12 +54,6 @@ Design Principles:
 
 ---
 
-## Demo
-
-<!-- Add embed or link when ready: `[demo video](URL)` -->
-
----
-
 ## System Overview
 
 ```
