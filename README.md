@@ -5,8 +5,21 @@ This project has been featured on Hackaday. Article link coming soon.
 
 ---
 
-THREEPIO is a physical, real-time, voice-based AI system inspired by C-3PO—built to behave like something you can actually talk to, not just prompt.
-It runs in ambient mode as a continuous listen → STT → LLM → TTS pipeline on a Raspberry Pi embedded in a physical prop.
+A real-time, AI-powered conversational droid that you can actually talk to.
+
+🎥 Demo: [https://your-youtube-link](https://www.youtube.com/watch?v=wB2CJm4sHcM)
+
+Want to try it yourself? Get it running locally:
+
+## 🚀 Quick Start
+
+```bash
+git clone https://github.com/spotozkin/threepio
+cd threepio
+pip install -r requirements.txt
+python -m threepio.main --ambient
+
+THREEPIO is a real-time, voice-based AI system running on a Raspberry Pi—designed to feel like you’re talking to a character (based on the Droid from Star Wars), not a chatbot.  It runs in ambient mode as a continuous listen → STT → LLM → TTS pipeline on a Raspberry Pi embedded in a physical prop.
 
 Focus areas:
 - Closed-loop speech on constrained hardware (latency, echo, barge-in)
