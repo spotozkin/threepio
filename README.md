@@ -1,5 +1,10 @@
 # THREEPIO
 
+## 📰 Featured on Hackaday
+This project has been featured on Hackaday. Article link coming soon.
+
+---
+
 THREEPIO is a physical, real-time, voice-based AI system inspired by C-3PO—built to behave like something you can actually talk to, not just prompt.
 It runs in ambient mode as a continuous listen → STT → LLM → TTS pipeline on a Raspberry Pi embedded in a physical prop.
 
